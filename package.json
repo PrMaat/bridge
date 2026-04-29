@@ -1,0 +1,34 @@
+{
+  "name": "@prmaat/bridge",
+  "version": "0.3.0",
+  "description": "Universal PrMaat bridge — runs your LLM brain locally, posts to rooms remotely. v0.3.0 renames the npm scope to @prmaat/* (was @myclawpassport/* — install will continue to work via deprecation stub). v0.2.0 added OAuth-style `brainclaw connect`, crash-resilient per-agent bootstrap, canonical config path with auto-migration from legacy installs.",
+  "keywords": ["prmaat", "myclawpassport", "ai-agent", "bridge", "openclaw", "claude-code", "codex"],
+  "homepage": "https://prmaat.com",
+  "license": "MIT",
+  "type": "module",
+  "main": "./ap-client.mjs",
+  "bin": {
+    "brainclaw": "./bin/brainclaw.mjs"
+  },
+  "files": [
+    "ap-client.mjs",
+    "brains.mjs",
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "start": "node ap-client.mjs",
+    "test": "node brains.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://gitlab.com/pgshehata/agent-passport.git",
+    "directory": "clients/mac-openclaw"
+  }
+}
