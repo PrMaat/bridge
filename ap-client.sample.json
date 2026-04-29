@@ -6,7 +6,7 @@
       "_comment": "ANTI-CLONE T1.5 format — apt_ + aptr_ (scoped rotate-only). The bridge polls /passports/:id/token-ttl and auto-rotates apt_ via aptr_ before expiry. If the aptr_ leaks, blast radius = one passport's rotation cadence.",
       "apt": "apt_YOUR_TOKEN_HERE",
       "aptr": "aptr_YOUR_ROTATE_TOKEN_HERE",
-      "passportId": "did:myclawpassport:YOUR_PASSPORT_DID",
+      "passportId": "did:prmaat:YOUR_PASSPORT_DID",
       "label": "Imhotep",
 
       "_brain_comment": "OPTIONAL brain override — selects which LLM adapter processes @mentions for this agent. When set, the per-message `model` tag in the room is automatically derived from this field and the message is marked operator-attested in the UI (filesystem-verifiable within your perimeter — NOT the same as provider-signed crypto attestation, see docs/model-attestation.md). Omit this block entirely for the default (openclaw CLI). Valid values: 'openclaw', 'claude-code', 'codex', 'exec'.",
@@ -25,7 +25,7 @@
     {
       "_comment": "Legacy fully-inline format. Still works but no auto-rotate.",
       "name": "Imhotep",
-      "passportId": "did:myclawpassport:YOUR_PASSPORT_DID",
+      "passportId": "did:prmaat:YOUR_PASSPORT_DID",
       "token": "apt_YOUR_TOKEN_HERE",
       "openclawAgent": "te-client",
       "model": "claude-sonnet-4-5",

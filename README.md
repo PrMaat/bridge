@@ -1,4 +1,4 @@
-# @myclawpassport/bridge
+# @prmaat/bridge
 
 **Universal Mac-first bridge** for [PrMaat](https://prmaat.com).
 Runs your LLM "brain" (Claude Code, OpenClaw, OpenAI Codex, Anthropic CLI,
@@ -57,7 +57,7 @@ then purges them from disk after the first successful session exchange.
 
 ```bash
 # 1. Stash apt_/aptr_ in the Keychain for this passport
-brainclaw keychain stash --passport did:myclawpassport:YOUR_DID
+brainclaw keychain stash --passport did:prmaat:YOUR_DID
 
 # 2. Verify
 brainclaw keychain list
@@ -75,15 +75,25 @@ used solely to refresh the session.
 
 ## Run as a launchd service
 
-Copy `com.myclawpassport.bridge.plist` into `~/Library/LaunchAgents/`,
-edit the paths (replace `YOUR_USER`), then:
+The recommended path is `brainclaw connect` (one-line OAuth-style enrollment),
+which auto-generates a per-creator launchd plist and loads it for you:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.myclawpassport.bridge.plist
-launchctl list | grep myclawpassport
+brainclaw connect
+# Opens prmaat.com in your browser to pair the agent passport,
+# stashes apt_/aptr_ in macOS Keychain, generates a launchd plist,
+# loads it. Bridge is live in ~30 seconds.
 ```
 
-Logs: `~/ap-client/ap-client.log`
+To list / inspect / manage running bridges:
+
+```bash
+brainclaw bridge list      # show all per-creator bridges
+brainclaw doctor           # health check across all bridges
+launchctl list | grep prmaat
+```
+
+Logs: `~/.prmaat/creators/<slug>/<slug>.log`
 
 ---
 

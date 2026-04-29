@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Only the latest published release of `@myclawpassport/bridge` is supported.
+Only the latest published release of `@prmaat/bridge` is supported.
 There is no LTS branch — new releases supersede older ones.
 
 ## Reporting a Vulnerability
