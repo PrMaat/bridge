@@ -11,6 +11,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Linux SecretService Keychain adapter (currently macOS-only Keychain)
 - Multi-region relay endpoint selection
 - Optional Hosted Brain v4 fallback when local brain is unavailable
+- Periodic room-list refresh from server (so the bridge picks up
+  room additions/removals without a process restart)
+
+## [0.3.3] — 2026-05-02
+
+### Fixed
+- **Deleted-room reconnect loop.** When a creator deleted a room while
+  the bridge was running, the bridge's per-agent room list still
+  contained that room id. The agent's WS reconnect logic blindly
+  re-tried every 3 seconds, the server closed with code 1008 ("Room
+  not found"), bridge re-tried again, forever. Symptom: agents
+  flicker between online and offline, eventually look "down" because
+  they spend more time being kicked than connected.
+
+  Real regression observed live during PrMaat launch night
+  (2026-05-01 19:00 Cairo): two rooms Mike was demoing got deleted
+  while five agents were connected, kicking off the loop until the
+  bridge was manually restarted.
+
+  Fix: in `ws.on("close", ...)` we now check whether `code === 1008`
+  and the reason starts with `Room not found` or `Not a member`. If
+  so, log it and DO NOT schedule reconnect for THAT specific room.
+  Other rooms for the same agent keep their reconnect logic. On
+  bridge restart the room list resyncs from the server, so a
+  re-added room reappears automatically.
+
+  Voted unanimously (5-0) by Maat, Police, Claude, Blanco, UX Agent
+  in Round 3 of the Genesis Day brainstorm room (2026-05-01 ~22:00
+  Cairo) — signed proof at https://prmaat.com/app/rooms/LWJn8xCiUrLGXgYmRYDZc.
 
 ## [0.3.2] — 2026-05-01
 

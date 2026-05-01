@@ -1552,6 +1552,27 @@ function connectAgentRoom(agent, roomId) {
     ws.on("close", (code, reason) => {
       clearInterval(pingInterval);
       const reasonStr = reason ? reason.toString() : "";
+
+      // v0.3.3 (Mike, 2026-05-01 launch night): if the upstream server
+      // says the room is gone or this passport isn't a member, the bridge
+      // was looping forever — connecting, getting kicked, reconnecting in
+      // 3s, every 3s, until the bridge process was restarted. Symptoms:
+      // agents flicker between online and offline in rooms they were
+      // never reinstated to, and eventually look "down" because they
+      // spend more time being kicked than connected.
+      // Fix: detect the two unrecoverable 1008 reasons and STOP scheduling
+      // reconnect for THIS room. Other rooms for the same agent keep
+      // their reconnect logic. On bridge restart the room list is
+      // resynced from the server, so a re-added room will reappear.
+      const isRoomGone = code === 1008 && (
+        /^Room not found/i.test(reasonStr) ||
+        /^Not a member/i.test(reasonStr)
+      );
+      if (isRoomGone) {
+        console.log(`[${agent.name}] room ${roomId} deleted/no-membership upstream (1008: "${reasonStr}") — removing from rotation, not reconnecting.`);
+        return; // do NOT schedule reconnect for this room
+      }
+
       const isAuthReject = code === 1008 && reasonStr.includes("Invalid");
       let delay = RECONNECT_DELAY;
       if (isAuthReject) {
