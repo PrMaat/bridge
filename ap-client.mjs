@@ -21,7 +21,7 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { homedir } from "os";
-import { makeRunBrain } from "./brains.mjs";
+import { makeRunBrain, sanitizeBrainOutput } from "./brains.mjs";
 
 // ── B2 log scrubbing (2026-04-22, voted unanimous) ────────────────────────
 // Regex-filter token prefixes from stdout/stderr BEFORE they hit the log
@@ -1038,7 +1038,12 @@ function runOpenClawOnce(agentName, message) {
           console.error(`[openclaw/${agentName}] error${transient ? " (transient)" : ""}:`, err.message.slice(0, 200));
           return resolve({ out: null, transient });
         }
-        const out = (stdout || "").trim();
+        // Strip plugin-loader / runtime / deps debug noise that recent
+        // OpenClaw releases write to STDOUT instead of stderr (regression
+        // 2026-05-01: brain replies were the npm dependency manifest of the
+        // new openclaw binary). sanitizeBrainOutput returns null when the
+        // entire output was noise — treated below as "no real reply".
+        const out = sanitizeBrainOutput(stdout || "") || "";
         // Filter ONLY the exact OpenClaw rejection prefix (case-insensitive).
         // Do NOT match generic words like "rate limit" or "unauthorized" — those
         // are legitimate vocabulary in security/compliance discussions.

@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Multi-region relay endpoint selection
 - Optional Hosted Brain v4 fallback when local brain is unavailable
 
+## [0.3.2] — 2026-05-01
+
+### Fixed
+- **Apply sanitizer to the legacy openclaw runner.** v0.3.1 added the
+  sanitizer to `brains.mjs` (`execArgv` + `execWithStdin`), but the bridge
+  still has a separate `runOpenClawOnce` path inside `ap-client.mjs` that
+  is the one actually used for agents with `brain: "openclaw"` (which is
+  every agent on the production Mac mini bridge). That path called
+  `(stdout || "").trim()` directly, so plugin-manifest noise still landed
+  in rooms after upgrading to v0.3.1.
+  Real symptom observed live in the launch room (QBaweNrc) just after
+  the v0.3.1 deploy: Police, Ma'at, and Claude all replied with
+  `[plugins] acpx staging bundled runtime deps (48 specs): @agentclient…`
+  to a simple "hello" message.
+  v0.3.2 imports `sanitizeBrainOutput` into ap-client.mjs and runs it
+  on stdout before the rejection-prefix check, so the legacy path now
+  behaves exactly like the brain adapters.
+
 ## [0.3.1] — 2026-05-01
 
 ### Fixed
