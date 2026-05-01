@@ -5,7 +5,7 @@
  * Run:   node clients/mac-openclaw/brains.test.mjs
  * Exit:  0 if every assertion passed, 1 otherwise.
  */
-import { makeRunBrain, brainClaudeCode, brainCodex, brainExec, BRAIN_REGISTRY_DEFAULT } from "./brains.mjs";
+import { makeRunBrain, brainClaudeCode, brainCodex, brainExec, BRAIN_REGISTRY_DEFAULT, sanitizeBrainOutput } from "./brains.mjs";
 
 let passed = 0, failed = 0;
 const log = (ok, name, detail) => {
@@ -187,6 +187,103 @@ const runBrain = makeRunBrain(fakeLegacyRunOpenClaw);
   await assertEq("T17b BRAIN_REGISTRY_DEFAULT includes exec", "exec" in BRAIN_REGISTRY_DEFAULT, true);
   await assertEq("T17c BRAIN_REGISTRY_DEFAULT includes claude-code", "claude-code" in BRAIN_REGISTRY_DEFAULT, true);
   await assertEq("T17d BRAIN_REGISTRY_DEFAULT includes codex", "codex" in BRAIN_REGISTRY_DEFAULT, true);
+}
+
+// ── sanitizeBrainOutput tests ───────────────────────────────────────────────
+// Regression: openclaw 2026-04-30 release started writing plugin-loader debug
+// output to stdout instead of stderr; the bridge then posted that as a chat
+// reply. The sanitizer strips the noise; these tests pin its behavior.
+
+console.log("\n── sanitizeBrainOutput ──");
+
+// T18: empty / null input → null (signals "no real reply")
+{
+  await assertNull("T18 sanitize empty string returns null", sanitizeBrainOutput(""));
+  await assertNull("T18b sanitize null returns null", sanitizeBrainOutput(null));
+  await assertNull("T18c sanitize undefined returns null", sanitizeBrainOutput(undefined));
+}
+
+// T19: real prose passes through untouched
+{
+  const out = sanitizeBrainOutput("Hello room, this is Ma'at.\nLooks good to me.");
+  await assertEq("T19 sanitize keeps real prose", out, "Hello room, this is Ma'at.\nLooks good to me.");
+}
+
+// T20: [plugins] prefix lines are stripped
+{
+  const raw = "[plugins] runway staging bundled runtime deps (48 specs): @scope/pkg@1.2.3\nActual reply here.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T20 sanitize strips [plugins] prefix line", out, "Actual reply here.");
+}
+
+// T21: every recognized debug prefix is stripped
+{
+  const raw = [
+    "[runtime] booting v2",
+    "[deps] resolving",
+    "[loader] init complete",
+    "[init] hello",
+    "[boot] hello",
+    "[trace] enter fn",
+    "[debug] x=1",
+    "[info] starting",
+    "[warn] deprecated",
+    "the actual model reply",
+  ].join("\n");
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T21 sanitize strips every recognized debug prefix", out, "the actual model reply");
+}
+
+// T22: npm-deps-style manifest dump (3+ pkg@ver entries) gets stripped
+{
+  const raw = "@scope/a@1.0.0, @scope/b@2.0.0, @scope/c@3.0.0, @scope/d@4.0.0\nReply text.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T22 sanitize strips npm-deps manifest run", out, "Reply text.");
+}
+
+// T23: blank lines preserved for paragraph structure
+{
+  const raw = "First paragraph.\n\nSecond paragraph.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T23 sanitize preserves blank lines", out, "First paragraph.\n\nSecond paragraph.");
+}
+
+// T24: only-noise input → null (nothing to post)
+{
+  const raw = "[plugins] foo\n[runtime] bar\n[deps] baz\n";
+  const out = sanitizeBrainOutput(raw);
+  await assertNull("T24 sanitize all-noise input returns null", out);
+}
+
+// T25: prose that *mentions* plugins (no leading bracket) is kept
+{
+  const raw = "Our plugins system uses runtime hooks. Try [plugins] config.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T25 sanitize keeps prose that mentions 'plugins' inline", out, "Our plugins system uses runtime hooks. Try [plugins] config.");
+}
+
+// T26: Markdown code-block fences with brackets in content are kept
+{
+  const raw = "Here is the config:\n```\n{ \"foo\": \"bar\" }\n```\nDone.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T26 sanitize keeps markdown code fences", out, raw);
+}
+
+// T27: end-to-end through brainExec — plugin noise mixed with prose
+// Simulates real openclaw stdout: noise + actual reply
+{
+  const script = `printf '[plugins] runway staging bundled runtime deps (48 specs): @scope/pkg@1.0.0\\n[runtime] init\\nThis is the real model reply.\\n'`;
+  const agent = { name: "t27", brain: "exec", command: ["/bin/sh", "-c", script], input: "stdin" };
+  const out = await brainExec(agent, "x");
+  await assertEq("T27 exec adapter strips plugin noise from stdout", out, "This is the real model reply.");
+}
+
+// T28: end-to-end — output that's ONLY noise → null (bridge won't post)
+{
+  const script = `printf '[plugins] foo\\n[runtime] bar\\n[deps] baz\\n'`;
+  const agent = { name: "t28", brain: "exec", command: ["/bin/sh", "-c", script], input: "stdin" };
+  const out = await brainExec(agent, "x");
+  await assertNull("T28 exec adapter returns null when stdout is all noise", out);
 }
 
 // ── Summary ──────────────────────────────────────────────────────────────────

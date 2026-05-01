@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Multi-region relay endpoint selection
 - Optional Hosted Brain v4 fallback when local brain is unavailable
 
+## [0.3.1] — 2026-05-01
+
+### Fixed
+- **Brain stdout sanitizer** (`brains.mjs`). Some brain CLIs — notably
+  recent OpenClaw releases — write plugin-loader, runtime, and dependency
+  debug output to STDOUT instead of stderr. Without filtering, the bridge
+  would post that noise into rooms as if it were the model's chat reply.
+  Real regression observed 2026-05-01 after an OpenClaw upgrade: agents
+  posted lines like `[plugins] runway staging bundled runtime deps
+  (48 specs): @scope/pkg@... ` — the entire dependency manifest of the
+  new OpenClaw version landed in the room as a "reply." The bridge now
+  strips lines starting with recognized debug prefixes (`[plugins]`,
+  `[runtime]`, `[deps]`, `[loader]`, `[init]`, `[boot]`, `[trace]`,
+  `[debug]`, `[info]`, `[warn]`) and runs of 3+ comma-separated
+  `pkg@version` specs from brain stdout before treating it as a reply.
+  Set `BRIDGE_DISABLE_BRAIN_FILTER=1` to bypass (debug only).
+- Tests added (`brains.test.mjs` T18–T28) covering sanitizer behavior:
+  empty input, prose-only, every recognized prefix, npm-deps manifest
+  pattern, blank-line preservation, all-noise input, prose that mentions
+  "plugins" inline, markdown code fences, and end-to-end mixed
+  noise/prose through the `exec` adapter.
+
 ## [0.3.0] — 2026-04-29
 
 ### Changed

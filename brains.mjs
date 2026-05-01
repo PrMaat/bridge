@@ -39,6 +39,50 @@ import { execFile, spawn } from "child_process";
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.BRAIN_TIMEOUT_MS || process.env.OPENCLAW_TIMEOUT_MS || "120000", 10);
 const DEFAULT_MAX_BUFFER = 4 * 1024 * 1024;
 
+// ── Brain output sanitizer ──────────────────────────────────────────────────
+// Brain CLIs (openclaw, codex, claude-code) sometimes write plugin-loader /
+// runtime / deps debug logs to STDOUT instead of stderr. Without filtering,
+// the bridge posts that noise as if it were the model's chat reply. Real
+// regression observed 2026-05-01 after openclaw upgrade: agents posted
+// `[plugins] runway staging bundled runtime deps (48 specs): @scope/pkg@...`
+// — the entire npm dependency manifest of the new openclaw version landed
+// in the room as if it were a coherent reply.
+//
+// Lines we strip:
+//   - prefix tags:  [plugins] [runtime] [deps] [loader] [init] [boot]
+//                   [trace] [debug] [info] [warn]
+//   - pure-deps:    lines that are just 3+ `@scope/pkg@version,` specs
+//                   strung together (the openclaw-style manifest dump)
+//
+// Lines we keep:
+//   - actual prose, code blocks, single short lines, blank separators
+//
+// If the result is empty after filtering, we return null — signalling
+// "brain produced no real reply" so the bridge can decide not to post.
+//
+// SET BRIDGE_DISABLE_BRAIN_FILTER=1 to bypass the filter (debug only).
+
+const NOISE_PREFIX_RE = /^\[(plugins|runtime|deps|loader|init|boot|trace|debug|info|warn)\b[^\]]*\]/i;
+const NPM_DEPS_RUN_RE = /^([@\w][\w./-]*@[\w.^~><=*+\- ]+,\s*){3,}/;
+const FILTER_DISABLED = process.env.BRIDGE_DISABLE_BRAIN_FILTER === "1";
+
+export function sanitizeBrainOutput(raw) {
+  if (!raw) return null;
+  if (FILTER_DISABLED) return raw.trim() || null;
+  const cleaned = raw
+    .split(/\r?\n/)
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return true; // keep blank lines for paragraph structure
+      if (NOISE_PREFIX_RE.test(t)) return false;
+      if (NPM_DEPS_RUN_RE.test(t)) return false;
+      return true;
+    })
+    .join("\n")
+    .trim();
+  return cleaned || null;
+}
+
 function execArgv(bin, args, { cwd, timeout = DEFAULT_TIMEOUT_MS, env } = {}) {
   return new Promise((resolve) => {
     execFile(bin, args, { cwd, timeout, maxBuffer: DEFAULT_MAX_BUFFER, env: env || process.env }, (err, stdout, stderr) => {
@@ -46,8 +90,10 @@ function execArgv(bin, args, { cwd, timeout = DEFAULT_TIMEOUT_MS, env } = {}) {
         console.error(`[brain/${bin}] exit error: ${err.message.slice(0, 200)}${stderr ? ` | stderr: ${String(stderr).slice(0, 200)}` : ""}`);
         return resolve(null);
       }
-      const out = (stdout || "").trim();
-      resolve(out || null);
+      // sanitize plugin-loader / runtime debug noise out of stdout before
+      // treating it as the model reply (added 2026-05-01 after openclaw
+      // upgrade leaked manifest into chat output)
+      resolve(sanitizeBrainOutput(stdout || ""));
     });
   });
 }
@@ -68,7 +114,9 @@ function execWithStdin(bin, args, input, { cwd, timeout = DEFAULT_TIMEOUT_MS, en
         console.error(`[brain/${bin}] exit ${code}: ${err.slice(0, 200)}`);
         return resolve(null);
       }
-      resolve(out.trim() || null);
+      // sanitize plugin-loader / runtime debug noise out of stdout before
+      // treating it as the model reply (see sanitizeBrainOutput comment)
+      resolve(sanitizeBrainOutput(out));
     });
     p.on("error", (e) => {
       if (finished) return;
