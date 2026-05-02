@@ -286,6 +286,68 @@ console.log("\n── sanitizeBrainOutput ──");
   await assertNull("T28 exec adapter returns null when stdout is all noise", out);
 }
 
+// ── v0.3.4 sanitizer tests: openclaw subsystem-debug prefixes ──────
+// Real leak observed 2026-05-02 in brainstorm Round 8:
+// "[agents/auth-profiles] read anthropic credentials from claude cli keychain"
+// got past v0.3.2's regex (which only matched plugins/runtime/deps/etc).
+
+// T29: agents/<sub> prefix gets stripped
+{
+  const raw = "[agents/auth-profiles] read anthropic credentials from claude cli keychain\nActual reply.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T29 sanitize strips [agents/auth-profiles] subsystem prefix", out, "Actual reply.");
+}
+
+// T30: secrets/<sub> prefix gets stripped
+{
+  const raw = "[secrets/keychain] resolved 5 entries\nReal model output here.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T30 sanitize strips [secrets/keychain] subsystem prefix", out, "Real model output here.");
+}
+
+// T31: hooks/<sub> prefix
+{
+  const raw = "[hooks/before-run] dispatched 3 listeners\nThe answer is 42.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T31 sanitize strips [hooks/before-run]", out, "The answer is 42.");
+}
+
+// T32: ipc/<sub> + storage/<sub> + cli/<sub> all stripped together
+{
+  const raw = [
+    "[ipc/parent] connected",
+    "[storage/cache] loaded 12 keys",
+    "[cli/run] started",
+    "[config/load] read /Users/.../openclaw.json",
+    "Hello, world.",
+  ].join("\n");
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T32 sanitize strips multiple openclaw subsystem prefixes", out, "Hello, world.");
+}
+
+// T33: prose that contains a slash-bracket pattern but NOT at line-start is kept
+{
+  const raw = "We use the [agents/auth-profiles] system internally — never displayed.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T33 sanitize keeps slash-bracket pattern when not at line start", out, "We use the [agents/auth-profiles] system internally — never displayed.");
+}
+
+// T34: prose that has a SquareBracketCapitalized prefix (likely a real
+// citation/reference) is KEPT — only lowercase-slash-lowercase looks debug.
+{
+  const raw = "[Wikipedia/CITATIONS] is a real reference style we should not strip.";
+  const out = sanitizeBrainOutput(raw);
+  await assertEq("T34 sanitize keeps PascalCase-bracket citations (uppercase first char)", out, "[Wikipedia/CITATIONS] is a real reference style we should not strip.");
+}
+
+// T35: end-to-end through brainExec with a mix the user actually saw
+{
+  const script = `printf '[agents/auth-profiles] read anthropic credentials from claude cli keychain\\n[secrets/keychain] hit\\nVoting A — bridge fix is the third-time-flagged.'`;
+  const agent = { name: "t35", brain: "exec", command: ["/bin/sh", "-c", script], input: "stdin" };
+  const out = await brainExec(agent, "x");
+  await assertEq("T35 exec adapter strips real openclaw debug while keeping vote prose", out, "Voting A — bridge fix is the third-time-flagged.");
+}
+
 // ── Summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed} passed, ${failed} failed`);

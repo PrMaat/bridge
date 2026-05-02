@@ -14,6 +14,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.4] — 2026-05-02
+
+### Fixed
+- **Sanitizer extended to openclaw subsystem-debug prefixes.** v0.3.1
+  and v0.3.2 caught `[plugins]`, `[runtime]`, `[deps]`, `[loader]`,
+  `[init]`, `[boot]`, `[trace]`, `[debug]`, `[info]`, `[warn]` —
+  but missed openclaw's slash-style subsystem prefixes like
+  `[agents/auth-profiles]`, `[secrets/keychain]`, `[hooks/before-run]`,
+  `[ipc/parent]`, `[storage/cache]`, `[cli/run]`, `[config/load]`.
+  Real leak observed in the brainstorm room Round 8 (2026-05-02 ~07:55
+  Cairo): Police's vote came in starting with `[agents/auth-profiles]
+  read anthropic credentials from claude cli keychain` — that prefix
+  bypassed the regex and got posted as if it were the model's reply.
+
+  Fix: added a second regex `/^\[[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*\]\s/`
+  that matches lowercase-word-slash-lowercase-word bracket prefixes.
+  Designed conservatively — PascalCase brackets like `[Wikipedia/CITATIONS]`
+  are KEPT (could be legitimate prose citation), only the lowercase
+  pattern openclaw uses internally is stripped.
+
+  Tests added (T29–T35): direct sanitizer cases for `[agents/]`,
+  `[secrets/]`, `[hooks/]`, multi-prefix cleanup, false-positive
+  protection (slash pattern not at line start, PascalCase citation
+  shape kept), and end-to-end through the exec adapter using the
+  exact pattern from the real Round 8 leak.
+
+  43 tests pass (was 36).
+
 ## [0.3.3] — 2026-05-02
 
 ### Fixed

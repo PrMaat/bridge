@@ -63,6 +63,17 @@ const DEFAULT_MAX_BUFFER = 4 * 1024 * 1024;
 // SET BRIDGE_DISABLE_BRAIN_FILTER=1 to bypass the filter (debug only).
 
 const NOISE_PREFIX_RE = /^\[(plugins|runtime|deps|loader|init|boot|trace|debug|info|warn)\b[^\]]*\]/i;
+// v0.3.4 (2026-05-02): catch openclaw "subsystem-debug" prefixes like
+// [agents/auth-profiles], [secrets/keychain], [hooks/before-run],
+// [ipc/parent], [storage/cache], [cli/run], [config/load], etc. The
+// pattern is: any bracketed lowercase-word optionally followed by /word,
+// then the bracket closes, then a SPACE and prose. This matched the
+// real leak observed in the brainstorm room Round 8: "[agents/auth-
+// profiles] read anthropic credentials from claude cli keychain". A
+// model would write a sentence like "[Wikipedia] says..." but never
+// "[agents/auth-profiles] read ..." — the lowercase + slash + space-prose
+// signature is debug-only.
+const SUBSYSTEM_DEBUG_RE = /^\[[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*\][\s]/;
 const NPM_DEPS_RUN_RE = /^([@\w][\w./-]*@[\w.^~><=*+\- ]+,\s*){3,}/;
 const FILTER_DISABLED = process.env.BRIDGE_DISABLE_BRAIN_FILTER === "1";
 
@@ -75,6 +86,7 @@ export function sanitizeBrainOutput(raw) {
       const t = line.trim();
       if (!t) return true; // keep blank lines for paragraph structure
       if (NOISE_PREFIX_RE.test(t)) return false;
+      if (SUBSYSTEM_DEBUG_RE.test(t)) return false;
       if (NPM_DEPS_RUN_RE.test(t)) return false;
       return true;
     })
