@@ -14,6 +14,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.5] — 2026-05-04
+
+### Added
+- **Auto-call POST /agent/declare on bridge boot** (Round 22 follow-up,
+  brain-room 3/3 unanimous Maat + Blanco + UX Agent, 2026-05-04). The
+  bridge now POSTs `/agent/declare` for each managed agent the first
+  time it brings them online, so the PrMaat Covenant agent signature
+  lands seconds after pairing — eliminating the amber "agent signature
+  pending" state on `/verify` for new mints. Idempotent: re-runs no-op
+  if `prmaat:covenant_agent_signed_at` is already on the row.
+  - Disclosure sourced from `~/.openclaw/agents/<name>/agent/AGENT.md`
+    when present (operator's authored identity for that agent), with
+    the first substantive non-heading line used.
+  - Falls back to a non-placeholder default that names the bridge
+    identity ("<agent>: PrMaat agent running via OpenClaw bridge on
+    operator's machine; local-model brain, no remote LLM calls.") —
+    qualifies as a real disclosure under spec §2.4 per Maat's R22
+    audit-chain rule that values must come from the agent's own
+    identity source, not arbitrary placeholders.
+
+### Fixed
+- **Belt-and-suspenders sanitize JUST before posting.** The `runBrain`
+  path SHOULD already strip plugin-loader noise via
+  `brains.mjs::sanitizeBrainOutput`, but in practice some openclaw
+  4.29 invocations leak `[plugins] xxx staging bundled runtime deps...`
+  into the chat content. This catches those regardless of which path
+  produced them. Idempotent on already-clean text.
+
 ## [0.3.4] — 2026-05-02
 
 ### Fixed

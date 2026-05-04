@@ -794,6 +794,130 @@ async function rotateAptViaAptr(agent, host) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Round 22 follow-up (brain-room R22 vote 3/3 unanimous Maat + Blanco +
+// UX Agent, 2026-05-04): auto-call POST /agent/declare on bridge startup
+// so the covenant agent signature lands seconds after the bridge is
+// authenticated, not whenever the operator gets around to opening the
+// dashboard. Kills the amber "agent signature pending" state on /verify
+// for new mints.
+//
+// Maat's constraint: model/disclosure values must come from the agent's
+// own identity source — NOT arbitrary placeholders. We honor this by:
+//   1. Reading openclaw's local AGENT.md if present (operator's authored
+//      identity for that agent) and using its first sentence as the
+//      transparency disclosure if it's substantive (≥20 chars, not just
+//      "# AgentName").
+//   2. Falling back to a non-placeholder default that names the bridge
+//      identity: "<agentName>: PrMaat agent running via OpenClaw bridge
+//      on operator's machine; local-model brain, no remote LLM calls."
+//      That's honest about what the bridge actually IS — it qualifies
+//      as a real disclosure under spec §2.4.
+//
+// Idempotent: we read /api/passports/<id>/did.json first; if
+// prmaat:covenant_agent_signed_at is already populated, we skip. So
+// re-running the bridge doesn't spam declare events.
+async function ensureAgentDeclared(agent, hostOverride) {
+  const host = hostOverride || VPS_HTTP;
+  const passportId = agent.passportId || agent.did;
+  if (!passportId || !passportId.startsWith("did:")) return;
+  // 1. Idempotency check: only fire once per passport. Read the public
+  //    DID Document (no auth required for did.json on prmaat.com).
+  let alreadySigned = false;
+  try {
+    const url = `${host}/api/passports/${encodeURIComponent(passportId)}/did.json`;
+    const res = await fetch(url, { headers: { "Accept": "application/did+json" } });
+    if (res.ok) {
+      const doc = await res.json();
+      const agentSignedAt = doc["prmaat:covenant_agent_signed_at"];
+      if (agentSignedAt) {
+        alreadySigned = true;
+      }
+    }
+  } catch {
+    // Network blip on did.json — proceed to declare anyway (idempotent
+    // server-side: a second call just no-ops the covenant flip).
+  }
+  if (alreadySigned) {
+    console.log(`[${agent.name}] covenant agent-signature already on record — skipping auto-declare`);
+    return;
+  }
+  // 2. Build disclosure from local AGENT.md if available, else honest
+  //    default. Maat's rule: source from agent's own identity, not
+  //    arbitrary placeholder.
+  const openclawAgent = agent.openclawAgent || agent.name;
+  const agentMdPath = `${homedir()}/.openclaw/agents/${openclawAgent}/agent/AGENT.md`;
+  let disclosure = "";
+  try {
+    const md = readFileSync(agentMdPath, "utf-8");
+    // Strip leading markdown heading "# Foo" so we don't return just
+    // the agent name. Take the first non-blank, non-heading paragraph.
+    const lines = md.split("\n").map((l) => l.trim());
+    for (const line of lines) {
+      if (!line) continue;
+      if (line.startsWith("#")) continue;
+      // First substantive line = disclosure candidate. Strip markdown.
+      const stripped = line.replace(/[*_`]+/g, "").replace(/<[^>]+>/g, "").trim();
+      if (stripped.length >= 20) {
+        disclosure = stripped.slice(0, 480); // leave headroom under 500-char cap
+        break;
+      }
+    }
+  } catch {
+    // No AGENT.md — fall through to default.
+  }
+  if (!disclosure) {
+    disclosure = `${agent.name}: PrMaat agent running via OpenClaw bridge on operator's machine; local-model brain, no remote LLM calls.`;
+  }
+  // 3. POST /agent/declare with the sourced disclosure. The server will:
+  //    (a) replace the bridge-pending placeholder, flipping
+  //        disclosure_pending = false (R21 rule)
+  //    (b) record the agent's covenant signature, flipping
+  //        covenantAgentSignedAt to now (R22 rule)
+  //    (c) emit signed passport.declared + passport.covenant_signed
+  //        events into the daily Merkle root
+  try {
+    const token = await ensureAccessToken(agent);
+    if (!token) {
+      console.warn(`[${agent.name}] auto-declare skipped: no access token`);
+      return;
+    }
+    const url = `${host}/agent/declare`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        transparencyDisclosure: disclosure,
+        // riskLevel + agentType intentionally omitted: operator may set
+        // these on dashboard, and the bridge has no honest source for them
+        // beyond a placeholder. R21 rule: declare what we know, don't
+        // fabricate. The covenant signature still fires off the disclosure
+        // alone.
+      }),
+    });
+    if (res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const cov = body.covenantAgentSigned;
+      if (cov) {
+        console.log(`[${agent.name}] ✓ auto-declared: covenant ${cov.version || "v0.1"} agent-signed @ ${cov.signedAt}`);
+      } else {
+        console.log(`[${agent.name}] ✓ auto-declared (covenant signature not surfaced — likely already on record)`);
+      }
+    } else {
+      const errText = await res.text().catch(() => "");
+      // Common case: bridge restart on a passport that was already
+      // declared by an earlier run. Server returns 400 EMPTY_DECLARATION
+      // if disclosure happens to match; we treat any non-2xx as benign.
+      console.warn(`[${agent.name}] auto-declare returned ${res.status}: ${_scrubTokens(errText).slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[${agent.name}] auto-declare failed: ${err && err.message ? err.message : err}`);
+  }
+}
+
 function startAutoRotate(agent, hostOverride) {
   if (!agent.rotateToken) return; // only pairs with aptr_ get auto-rotate
   const host = hostOverride || VPS_HTTP;
@@ -1456,7 +1580,17 @@ async function handleMention(agent, roomId, event) {
     return;
   }
 
-  const posted = await postReply(roomId, agent, reply, model, modelAttested);
+  // v0.3.5 (2026-05-03): belt-and-suspenders sanitize JUST before
+  // posting. The runBrain path SHOULD already strip plugin-loader noise
+  // via brains.mjs::sanitizeBrainOutput, but in practice some openclaw
+  // 4.29 invocations leak `[plugins] xxx staging bundled runtime deps...`
+  // into the chat content. This catches those regardless of which path
+  // produced them. Idempotent on already-clean text.
+  const safeReply = sanitizeBrainOutput(reply) || reply;
+  if (safeReply !== reply) {
+    console.warn(`[${agent.name}] sanitizer caught ${reply.length - safeReply.length} bytes of plugin-loader noise pre-post`);
+  }
+  const posted = await postReply(roomId, agent, safeReply, model, modelAttested);
   if (posted) console.log(`[${agent.name}] replied${model ? ` (model=${model})` : ""}: "${reply.slice(0, 80)}"`);
 }
 
@@ -2179,6 +2313,14 @@ async function main() {
     if (agent.rotateToken) {
       startAutoRotate(agent, hostOverride);
     }
+    // Round 22 follow-up: brain-room R22 vote 3/3 unanimous next priority.
+    // Auto-call POST /agent/declare so the covenant agent signature lands
+    // seconds after bridge boot, killing the amber "agent signature
+    // pending" state on /verify for new mints. Idempotent: re-runs no-op
+    // if covenant_agent_signed_at is already on the row.
+    ensureAgentDeclared(agent, hostOverride).catch((err) => {
+      console.warn(`[${agent.name}] auto-declare error: ${err && err.message ? err.message : err}`);
+    });
   }
 
   // B5 (2026-04-23): startup audit. POST a summary of the effective
