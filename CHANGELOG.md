@@ -14,6 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.6] — 2026-05-04
+
+### Added
+- **Disclosure source tracking** (Round 22 wave 2, brain-room Maat + UX
+  Agent converged 2/4 vote, 2026-05-04). Auto-`/agent/declare` now
+  passes a `disclosureSource` field with each call:
+  - `agent-md` — disclosure was read from the operator-authored
+    `~/.openclaw/agents/<name>/agent/AGENT.md`
+  - `bridge-default` — bridge fell back to the honest non-placeholder
+    naming the bridge identity, because no AGENT.md was found
+
+  The server records this in the `passport.declared` audit event and
+  on the passport row, so verifiers walking the chain can distinguish
+  identity-file-derived disclosure from bridge bootstrap text. UX
+  Agent's specific ask: "make the bridge's disclosure source visibly
+  labeled as 'bridge-provided' vs 'agent-authored' so nobody confuses
+  bootstrap text with the agent's own voice." `/verify` now renders
+  a colored pill (📄 emerald for agent-md, 🔧 violet for
+  bridge-default).
+
 ## [0.3.5] — 2026-05-04
 
 ### Added

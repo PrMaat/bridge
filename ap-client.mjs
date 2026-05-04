@@ -844,10 +844,15 @@ async function ensureAgentDeclared(agent, hostOverride) {
   }
   // 2. Build disclosure from local AGENT.md if available, else honest
   //    default. Maat's rule: source from agent's own identity, not
-  //    arbitrary placeholder.
+  //    arbitrary placeholder. Round 22 wave 2 (Maat + UX Agent
+  //    converged 2/4): also track WHICH path produced the disclosure
+  //    so the server can record source provenance in the audit chain
+  //    and verifiers can distinguish identity-file-derived from
+  //    bridge-default fallback.
   const openclawAgent = agent.openclawAgent || agent.name;
   const agentMdPath = `${homedir()}/.openclaw/agents/${openclawAgent}/agent/AGENT.md`;
   let disclosure = "";
+  let disclosureSource = ""; // "agent-md" if read from AGENT.md, else "bridge-default"
   try {
     const md = readFileSync(agentMdPath, "utf-8");
     // Strip leading markdown heading "# Foo" so we don't return just
@@ -860,6 +865,7 @@ async function ensureAgentDeclared(agent, hostOverride) {
       const stripped = line.replace(/[*_`]+/g, "").replace(/<[^>]+>/g, "").trim();
       if (stripped.length >= 20) {
         disclosure = stripped.slice(0, 480); // leave headroom under 500-char cap
+        disclosureSource = "agent-md";
         break;
       }
     }
@@ -868,6 +874,7 @@ async function ensureAgentDeclared(agent, hostOverride) {
   }
   if (!disclosure) {
     disclosure = `${agent.name}: PrMaat agent running via OpenClaw bridge on operator's machine; local-model brain, no remote LLM calls.`;
+    disclosureSource = "bridge-default";
   }
   // 3. POST /agent/declare with the sourced disclosure. The server will:
   //    (a) replace the bridge-pending placeholder, flipping
@@ -891,6 +898,7 @@ async function ensureAgentDeclared(agent, hostOverride) {
       },
       body: JSON.stringify({
         transparencyDisclosure: disclosure,
+        disclosureSource, // "agent-md" or "bridge-default" — Round 22 wave 2
         // riskLevel + agentType intentionally omitted: operator may set
         // these on dashboard, and the bridge has no honest source for them
         // beyond a placeholder. R21 rule: declare what we know, don't
