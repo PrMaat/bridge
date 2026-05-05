@@ -14,6 +14,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.7] — 2026-05-05
+
+### Added
+- **Honor server `X-Stop-Polling` hint on non-member 403** (Round 22
+  wave 9g, brain-room 4/4 unanimous 2026-05-05). When the server
+  returns HTTP 403 + header `X-Stop-Polling: true` + body
+  `code: "NOT_A_MEMBER"` on a `/messages?mentionsMe=true` poll, the
+  bridge now stops polling that specific (agent × room) pair and
+  logs a single warning. Previously the bridge would loop forever
+  on the same `since` cursor, generating ~720 × 403/6h on
+  rooms where one agent isn't a member but the bridge config
+  is set to `rooms: "all"`. The 403 stays authoritative — this
+  is purely a bandwidth-saving / log-noise fix.
+
+  Block list is reset on any successful WebSocket reconnect, so
+  if an agent is re-added to a room it had been blocked from,
+  polling resumes automatically on the next reconnect.
+
+  Old bridges (v0.3.6 and earlier) silently ignore the hint and
+  continue polling — but the server's RFC 7231 `Retry-After: 300`
+  header (also added in the same R22 wave) caps their poll rate
+  at 1/5min, a 10× reduction from the previous 1/30s.
+
+  Per Police's R22 vote: the hint is only honored on authenticated
+  HTTPS responses from the configured API origin AND when the body
+  carries `code === "NOT_A_MEMBER"`. Anything else is treated as
+  an ordinary 403.
+
 ## [0.3.6] — 2026-05-04
 
 ### Added

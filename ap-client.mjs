@@ -1010,6 +1010,20 @@ const MENTION_POLL_MS = parseInt(process.env.AP_MENTION_POLL_MS || "45000", 10);
 const MENTION_POLL_STARTUP_DELAY_MS = 8_000;
 const MENTION_POLL_INITIAL_LOOKBACK_MS = 10 * 60 * 1000;
 
+// Round 22 wave 9g (v0.3.7, brain-room 4/4 unanimous 2026-05-05): track
+// mention-poll intervals so we can stop them when the server returns
+// X-Stop-Polling: true on a non-member 403. Without this, a bridge
+// configured with `rooms: "all"` polls every room for every agent —
+// non-member (passport × room) pairs loop on the same `since` cursor
+// forever, getting 403 every cycle. The audit caught 723 × 403 in
+// 6h on one room from this bug.
+//
+// Map key: `${agentName}|${roomId}` (agent names are unique per bridge
+// instance per memory). Value: { intervalId, blockedReason? }.
+const mentionPollHandles = new Map();
+
+function mentionPollKey(agent, roomId) { return `${agent.name}|${roomId}`; }
+
 async function pollMentions(agent, roomId, host, state) {
   const token = await ensureAccessToken(agent);
   if (!token) return;
@@ -1021,6 +1035,27 @@ async function pollMentions(agent, roomId, host, state) {
       { headers: { "Authorization": `Bearer ${token}` } },
     );
     if (!res.ok) {
+      // Round 22 wave 9g: server hint says "stop polling this pair."
+      // Per Police's R22 vote: only honor on authenticated HTTPS from
+      // the configured API origin (we already only call VPS_HTTP / host)
+      // AND when the body says NOT_A_MEMBER (verified below). The 403
+      // is authoritative regardless; this just stops the bandwidth waste.
+      if (res.status === 403 && res.headers.get("x-stop-polling") === "true") {
+        let bodyCode = null;
+        try {
+          const body = await res.json();
+          bodyCode = body?.code;
+        } catch { /* body parse failed; treat as ordinary 403 */ }
+        if (bodyCode === "NOT_A_MEMBER") {
+          const key = mentionPollKey(agent, roomId);
+          const handle = mentionPollHandles.get(key);
+          if (handle?.intervalId) clearInterval(handle.intervalId);
+          mentionPollHandles.set(key, { intervalId: null, blockedReason: "NOT_A_MEMBER" });
+          // Single warning per drop. Reset on reconnect (resetMentionPollBlocks).
+          console.warn(`[${agent.name}] mention-poll ${roomId.slice(0, 10)} stopped: NOT_A_MEMBER (server X-Stop-Polling hint honored)`);
+          return;
+        }
+      }
       // 404/410 (room closed) is a normal terminal state — no need to spam logs.
       if (res.status !== 404 && res.status !== 410) {
         console.warn(`[${agent.name}] mention-poll ${roomId.slice(0, 10)} HTTP ${res.status}`);
@@ -1059,9 +1094,35 @@ async function pollMentions(agent, roomId, host, state) {
 
 function startMentionPoll(agent, roomId, hostOverride) {
   const host = hostOverride || VPS_HTTP;
+  const key = mentionPollKey(agent, roomId);
+
+  // Round 22 wave 9g: if this (agent × room) is blocked from a
+  // previous NOT_A_MEMBER hint, don't restart the poll. resetMentionPollBlocks()
+  // (called on bridge reconnect / membership refresh) clears the block.
+  const existing = mentionPollHandles.get(key);
+  if (existing?.blockedReason) return;
+  if (existing?.intervalId) clearInterval(existing.intervalId);
+
   const state = { since: new Date(Date.now() - MENTION_POLL_INITIAL_LOOKBACK_MS).toISOString() };
   setTimeout(() => pollMentions(agent, roomId, host, state), MENTION_POLL_STARTUP_DELAY_MS);
-  setInterval(() => pollMentions(agent, roomId, host, state), MENTION_POLL_MS);
+  const intervalId = setInterval(() => pollMentions(agent, roomId, host, state), MENTION_POLL_MS);
+  mentionPollHandles.set(key, { intervalId, blockedReason: null });
+}
+
+// Round 22 wave 9g: clear the (agent × room) block list. Called when a
+// bridge reconnects (membership may have changed: agent newly added /
+// removed from a room) so we re-attempt polls fresh.
+function resetMentionPollBlocks() {
+  let cleared = 0;
+  for (const [key, h] of mentionPollHandles.entries()) {
+    if (h.blockedReason) {
+      mentionPollHandles.delete(key);
+      cleared++;
+    }
+  }
+  if (cleared > 0) {
+    console.log(`[bridge] mention-poll blocks cleared (${cleared} pairs); will re-attempt on next room subscription.`);
+  }
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -1635,6 +1696,11 @@ function connectAgentRoom(agent, roomId) {
       // A successful handshake means the token is good — reset the circuit
       // breaker so future transient 1008s (rotation race) get 5 more chances.
       consecutiveAuthRejections = 0;
+      // Round 22 wave 9g: a successful WS handshake means our auth + room
+      // membership are fresh in the server's view. Clear any stale
+      // mention-poll blocks so we re-attempt polls in case membership
+      // changed (e.g., we were re-added to a room we had been blocked from).
+      resetMentionPollBlocks();
       // Broadcast "listening" status on connect
       broadcastStatus(roomId, agent.passportId, "listening");
       pingInterval = setInterval(() => {
