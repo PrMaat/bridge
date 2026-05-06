@@ -1386,13 +1386,28 @@ const TOOL_CALL_LINE_RE = /^\s*TOOL_CALL:\s*(.+?)\s*$/;
 function validateToolCall(cmd) {
   // Reject shell metacharacters that would break out of the single-command contract.
   // Pipes, redirects, backticks, $(), &&, ||, ; — all forbidden.
-  if (/[;&|`><$\\]/.test(cmd)) return { ok: false, reason: "shell metacharacters not allowed" };
+  // v0.3.8 (Mike directive 2026-05-06, post external audit by peer Claude session):
+  //   `@` added to blocklist. curl interprets `@filename` as "read this file
+  //   as the request body" — without this fix, a prompt-injection in any room
+  //   could trigger `curl -d @/etc/passwd https://prmaat.com/api/...` and
+  //   exfiltrate local files to the (still-allowlisted) prmaat.com origin.
+  //   Even though the network destination is allowlisted, allowing arbitrary
+  //   local file content into the request body is a real exfil vector.
+  if (/[;&|`><$\\@]/.test(cmd)) return { ok: false, reason: "shell metacharacters not allowed (incl. curl @-file syntax)" };
   if (cmd.includes("\n")) return { ok: false, reason: "multi-line commands not allowed" };
   // Must start with curl
   const trimmed = cmd.trim();
   if (!/^curl\s/i.test(trimmed)) return { ok: false, reason: "only curl is allowed" };
-  // Must target prmaat.com (any protocol/path)
-  if (!/https?:\/\/(www\.)?myclawpassport\.com(\/|\s|$|")/i.test(trimmed)) {
+  // Must target prmaat.com (any protocol/path).
+  // v0.3.8 (Mike directive 2026-05-06): the regex used to check
+  // `myclawpassport.com` (the legacy domain), while the error message said
+  // `prmaat.com`. Net effect of the bug: tool-calls to the *new* canonical
+  // origin (prmaat.com) were being REJECTED, while tool-calls to the *old*
+  // domain were being ACCEPTED. This is now corrected — only prmaat.com is
+  // allowed; if you genuinely need legacy-domain support, add an explicit
+  // alternation ` | (www\.)?myclawpassport\.com` here, but the backend
+  // shouldn't be receiving tool-calls on the old origin in 2026.
+  if (!/https?:\/\/(www\.)?prmaat\.com(\/|\s|$|")/i.test(trimmed)) {
     return { ok: false, reason: "curl must target prmaat.com" };
   }
   // Hard length cap (defense-in-depth against prompt injection stuffing)

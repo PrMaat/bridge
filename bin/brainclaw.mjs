@@ -220,7 +220,32 @@ async function cmdStatus() {
   }
 }
 
+// Module-level guard so a single CLI flag can disable every prompt the bridge
+// would otherwise raise. Set by the dispatcher when --non-interactive is on
+// (v0.3.8, Mike directive 2026-05-06). The point is to give AI agents and CI
+// runners an honest path: every required value comes from --config or env,
+// and if any is missing the bridge fails loudly instead of asking the
+// session to "decide" a value it has no business deciding.
+let __NON_INTERACTIVE = false;
+let __NO_SELF_ATTEST = false;
+function setNonInteractive(v) { __NON_INTERACTIVE = !!v; }
+function setNoSelfAttest(v) { __NO_SELF_ATTEST = !!v; }
+function isNonInteractive() { return __NON_INTERACTIVE; }
+function isNoSelfAttest() { return __NO_SELF_ATTEST; }
+
 async function prompt(rl, question, def) {
+  // v0.3.8: under --non-interactive, every prompt is a hard error — the
+  // operator must supply the answer in --config (or env) ahead of time.
+  // The thrown error names the missing field so config files can be
+  // patched in one round-trip rather than discovered prompt-by-prompt.
+  if (__NON_INTERACTIVE) {
+    throw new Error(
+      `[brainclaw] --non-interactive mode: required value missing for prompt: "${question}". ` +
+      `Add this field to the config file you pass via --config, or unset --non-interactive ` +
+      `to use stdin prompts. The bridge intentionally refuses to fall back to defaults under ` +
+      `--non-interactive — every attestable value must come from the operator-controlled config.`
+    );
+  }
   const answer = (await rl.question(def ? `${question} [${def}] ` : `${question} `)).trim();
   return answer || def || "";
 }
@@ -2255,14 +2280,30 @@ Example:
 
 async function main() {
   const [, , cmd, ...rest] = process.argv;
+
+  // v0.3.8 (Mike directive 2026-05-06, post peer-Claude principled-refusal
+  // audit): two cross-cutting flags consumed BEFORE the per-command
+  // dispatcher sees rest[]. They flip module-level guards so every prompt
+  // (in any subcommand) becomes a hard error when --non-interactive is on,
+  // and every "self-attestation" code path (env-derived model, etc.) is
+  // refused when --no-self-attest is on. This gives AI agents and CI
+  // runners a clean enrollment path: the operator pre-fills every
+  // attestable value in --config, and the bridge runs purely operationally.
+  const flagFiltered = [];
+  for (const arg of rest) {
+    if (arg === "--non-interactive") { setNonInteractive(true); continue; }
+    if (arg === "--no-self-attest")  { setNoSelfAttest(true);  continue; }
+    flagFiltered.push(arg);
+  }
+
   switch (cmd) {
-    case "start":    return cmdStart(rest);
-    case "init":     return cmdInit(rest);
-    case "connect":  return cmdConnect(rest);
-    case "status":   return cmdStatus(rest);
-    case "doctor":   return cmdDoctor(rest);
-    case "keychain": return cmdKeychain(rest);
-    case "bridge":   return cmdBridge(rest);
+    case "start":    return cmdStart(flagFiltered);
+    case "init":     return cmdInit(flagFiltered);
+    case "connect":  return cmdConnect(flagFiltered);
+    case "status":   return cmdStatus(flagFiltered);
+    case "doctor":   return cmdDoctor(flagFiltered);
+    case "keychain": return cmdKeychain(flagFiltered);
+    case "bridge":   return cmdBridge(flagFiltered);
     case "version":
     case "--version":
     case "-v":       return printVersion();

