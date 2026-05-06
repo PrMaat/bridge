@@ -14,6 +14,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Periodic room-list refresh from server (so the bridge picks up
   room additions/removals without a process restart)
 
+## [0.3.9] — 2026-05-07
+
+### Brand cleanup — operator-facing paths and services rebrand to PrMaat
+
+The bridge had been publishing under `@prmaat/*` since v0.3.0 and
+addressing `prmaat.com` as the canonical origin since the rebrand, but
+several operator-facing internals still leaked the legacy `myclawpassport`
+brand:
+
+- A fresh install would create `~/.myclawpassport/` in the user's home
+  directory.
+- macOS Keychain entries went under service `com.myclawpassport.bridge`.
+- Per-creator launchd plists were named `com.myclawpassport.bridge.<slug>`.
+- The default `MYCLAW_HOME` env override implied the legacy name was
+  authoritative.
+
+This release renames all of the above to the new brand while preserving
+**full read backward compatibility** with existing installs.
+
+### Renamed (canonical for new writes)
+
+- `~/.myclawpassport/` → **`~/.prmaat/`** (workspace root)
+- `MYCLAW_HOME` env → **`PRMAAT_HOME`** (legacy alias still respected)
+- Keychain service `com.myclawpassport.bridge` → **`com.prmaat.bridge`**
+- Per-creator plist labels `com.myclawpassport.bridge.<slug>` →
+  **`com.prmaat.bridge.<slug>`**
+- Per-creator keychain services `com.myclawpassport.bridge.<slug>` →
+  **`com.prmaat.bridge.<slug>`**
+- Help-text path references in `brainclaw init` / `brainclaw keychain` /
+  `brainclaw doctor` / etc.
+
+### Backward-compat preserved
+
+- **Workspace migration on first boot.** If `~/.myclawpassport/` exists
+  and `~/.prmaat/` doesn't, the bridge `cp -R`'s the legacy directory
+  forward to the new path on the first invocation. Idempotent — second
+  run is a no-op. Legacy directory is left in place untouched so an
+  operator can revert by `rm -rf ~/.prmaat`.
+- **Config file migration.** `resolveConfigPath()` checks
+  `~/.prmaat/ap-client.json` first; if missing, copies from
+  `~/.myclawpassport/ap-client.json` (or even older
+  `~/ap-client/ap-client.json`) forward.
+- **Keychain reads fall back to legacy service.** `keychainGet()` tries
+  `com.prmaat.bridge` first; on miss, retries `com.myclawpassport.bridge`
+  (unless `AP_KEYCHAIN_SERVICE` was explicitly overridden, which means
+  the operator wants exact-match semantics). Found legacy entries are
+  best-effort migrated forward via `add-generic-password -U` against
+  the new service name.
+- **Doctor checks both plist names.** `brainclaw doctor` finds plists
+  under either the new or legacy label and reports them, so operators
+  with already-installed legacy bridges get a clear "your plist is
+  under the old name; rerun `brainclaw bridge connect <label>` to
+  rename" signal.
+- **DID prefix validation accepts both.** All commands that previously
+  required `did:myclawpassport:...` now accept either
+  `did:prmaat:...` (canonical, post-rebrand) or
+  `did:myclawpassport:...` (legacy, pre-rebrand — W3C-immutable, must
+  keep validating forever per the trust-is-testable thesis).
+
+### Operator migration path (no required action)
+
+Existing installs continue to work transparently. To complete the
+brand-aligned migration on your machine:
+
+```sh
+# 1. Bridge will auto-migrate the workspace on first invocation.
+#    Verify it landed:
+ls ~/.prmaat/
+
+# 2. (Optional) For per-creator launchd plists, rename in place by
+#    re-running brainclaw bridge connect for each creator:
+brainclaw bridge connect <creator-label>
+# This bootouts the legacy plist and installs the renamed one.
+
+# 3. (Optional) Once everything works, prune the legacy paths:
+rm -rf ~/.myclawpassport
+# Keychain entries under com.myclawpassport.bridge can be deleted
+# via Keychain Access.app or `security delete-generic-password -s
+# com.myclawpassport.bridge -a <account>`.
+```
+
+### Package.json polish (also in this release)
+
+The accumulated multi-paragraph description has been trimmed to a
+clean one-liner. The `myclawpassport` keyword was dropped; new
+discovery-friendly keywords added: `agent-identity`, `agent-passport`,
+`did`, `verifiable-credentials`, `audit-chain`.
+
 ## [0.3.8] — 2026-05-06
 
 ### Security

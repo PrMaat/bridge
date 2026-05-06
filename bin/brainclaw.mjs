@@ -9,7 +9,9 @@
  * Subcommands:
  *   brainclaw init       Interactive pairing — prompts for the 8-char code
  *                        the creator sees in the web UI, claims it, writes
- *                        ~/.myclawpassport/ap-client.json with the session.
+ *                        ~/.prmaat/ap-client.json with the session.
+ *                        (Legacy ~/.myclawpassport/ still read for backward
+ *                        compat; auto-migrated forward on first boot.)
  *   brainclaw start      Run the bridge in the foreground (Ctrl-C to stop).
  *   brainclaw status     Check if the bridge is running + last 10 log lines.
  *   brainclaw doctor     Self-diagnostic: node version, config, file perms,
@@ -21,11 +23,12 @@
  *
  * Env overrides (forwarded to the bridge runtime):
  *   AP_HTTP, AP_WS        VPS endpoints (default https://prmaat.com)
- *   AP_CONFIG             Path to ap-client.json (default ~/.myclawpassport/ap-client.json)
+ *   AP_CONFIG             Path to ap-client.json (default ~/.prmaat/ap-client.json)
+ *   PRMAAT_HOME           Workspace root (default ~/.prmaat). MYCLAW_HOME alias still respected for backward compat.
  *   OPENCLAW_BIN          OpenClaw CLI path (default /Users/mikebot/.openclaw/bin/openclaw)
  *   AP_TOOLS_ENABLED      Per-agent tool-call allowlist (default off)
  */
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { createHash } from "crypto";
 import { readFileSync, existsSync, mkdirSync, statSync, chmodSync, writeFileSync, renameSync } from "fs";
 import { dirname, join, resolve } from "path";
@@ -39,20 +42,50 @@ const PACKAGE_ROOT = resolve(__dirname, "..");
 const BRIDGE_ENTRY = join(PACKAGE_ROOT, "ap-client.mjs");
 const PKG_JSON_PATH = join(PACKAGE_ROOT, "package.json");
 
-const HOME_DIR = process.env.MYCLAW_HOME || join(homedir(), ".myclawpassport");
+// v0.3.9 (Mike directive 2026-05-06, wave 23): canonical home dir is now
+// ~/.prmaat. PRMAAT_HOME is the canonical env override; MYCLAW_HOME is
+// retained as a legacy alias so existing operator launchd configs (which
+// may set MYCLAW_HOME) keep working without edits.
+const LEGACY_HOME_DIR = join(homedir(), ".myclawpassport");
+const HOME_DIR = process.env.PRMAAT_HOME || process.env.MYCLAW_HOME || join(homedir(), ".prmaat");
 const DEFAULT_CONFIG = join(HOME_DIR, "ap-client.json");
 const DEFAULT_VPS = process.env.AP_HTTP || "https://prmaat.com";
 
+// First-boot migration: copy legacy ~/.myclawpassport/ contents forward to
+// ~/.prmaat/ on first invocation if the new dir doesn't yet exist. This
+// is idempotent — once ~/.prmaat exists, we skip. Operator can revert by
+// `rm -rf ~/.prmaat` (legacy is left in place untouched).
+function migrateLegacyHomeIfNeeded() {
+  if (process.env.PRMAAT_HOME || process.env.MYCLAW_HOME) return; // explicit override → skip
+  if (existsSync(HOME_DIR)) return; // already migrated or fresh install
+  if (!existsSync(LEGACY_HOME_DIR)) return; // nothing to migrate
+  try {
+    mkdirSync(HOME_DIR, { recursive: true });
+    // Use cp -R to preserve perms/structure; macOS + Linux both support it.
+    // ESM-safe: execFileSync imported at the top with spawn.
+    execFileSync("/bin/cp", ["-R", `${LEGACY_HOME_DIR}/.`, HOME_DIR + "/"], { stdio: "ignore" });
+    console.log(`[brainclaw] migrated workspace: ${LEGACY_HOME_DIR} → ${HOME_DIR}`);
+    console.log(`[brainclaw]   (legacy directory kept for rollback; remove manually after verifying)`);
+  } catch (err) {
+    console.warn(`[brainclaw] workspace migration failed (non-fatal, will read from legacy path): ${err.message}`);
+  }
+}
+migrateLegacyHomeIfNeeded();
+
 // ── Step 3 (room vote 2026-04-27 Q1=🅐 unanimous): per-creator isolation ──
 // Workspace tree:
-//   ~/.myclawpassport/
+//   ~/.prmaat/
 //     ap-client.json                     (legacy/shared — kept for backward compat)
 //     creators.json                      (registry of all per-creator bridges)
 //     creators/<slug>/ap-client.json     (per-creator config)
 //     creators/<slug>/<slug>.log         (per-creator daemon log)
-// Keychain: service `com.myclawpassport.bridge.<slug>` per creator (Police's
+// Keychain: service `com.prmaat.bridge.<slug>` per creator (Police's
 //   Q1=🅐 vote: process+keychain isolation is the actual security boundary).
-// launchd: `com.myclawpassport.bridge.<slug>` plist per creator (Q1=🅐).
+//   v0.3.9 (wave 23): renamed from `com.myclawpassport.bridge.<slug>`;
+//   read paths fall back to the legacy service for backward compat.
+// launchd: `com.prmaat.bridge.<slug>` plist per creator (Q1=🅐).
+//   v0.3.9: renamed; legacy `com.myclawpassport.bridge.<slug>` plists are
+//   detected and recommended-for-update at `brainclaw bridge list` time.
 //
 // AP_SHARED_BRIDGE=1 (Q3=🅒 minority compat) reverts to single shared bridge.
 const SHARED_BRIDGE_OVERRIDE = process.env.AP_SHARED_BRIDGE === "1";
@@ -60,17 +93,29 @@ const CREATORS_DIR = join(HOME_DIR, "creators");
 const CREATORS_REGISTRY = join(HOME_DIR, "creators.json");
 
 /** Sanitize a creator id (DID) into a filename-safe slug. Mirrors the
- *  server-side creatorIdToSlug() in src/services/deviceConnect.ts. */
+ *  server-side creatorIdToSlug() in src/services/deviceConnect.ts.
+ *  v0.3.9: accepts both the legacy `did:myclawpassport:creator:*` prefix
+ *  and the new canonical `did:prmaat:creator:*` prefix so existing rooms
+ *  and historical creators continue to slug correctly. */
 function creatorIdToSlug(creatorId) {
-  const tail = String(creatorId || "").replace(/^did:myclawpassport:creator:/, "");
+  const tail = String(creatorId || "")
+    .replace(/^did:prmaat:creator:/, "")
+    .replace(/^did:myclawpassport:creator:/, "");
   return tail.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 }
 
 function creatorWorkspace(slug) { return join(CREATORS_DIR, slug); }
 function creatorConfig(slug)    { return join(CREATORS_DIR, slug, "ap-client.json"); }
-function creatorPlistLabel(slug){ return `com.myclawpassport.bridge.${slug}`; }
+function creatorPlistLabel(slug){ return `com.prmaat.bridge.${slug}`; }
 function creatorPlistPath(slug) { return join(homedir(), "Library", "LaunchAgents", `${creatorPlistLabel(slug)}.plist`); }
-function creatorKeychainService(slug) { return `com.myclawpassport.bridge.${slug}`; }
+function creatorKeychainService(slug) { return `com.prmaat.bridge.${slug}`; }
+// v0.3.9 (wave 23): legacy plist label / keychain service for the same
+// creator slug. Used for read-path backward compat (e.g., detecting an
+// already-installed legacy plist before writing a new one, or reading
+// keychain items written under the old service name).
+function legacyCreatorPlistLabel(slug)   { return `com.myclawpassport.bridge.${slug}`; }
+function legacyCreatorPlistPath(slug)    { return join(homedir(), "Library", "LaunchAgents", `${legacyCreatorPlistLabel(slug)}.plist`); }
+function legacyCreatorKeychainService(slug) { return `com.myclawpassport.bridge.${slug}`; }
 
 function ensureCreatorWorkspace(slug, label) {
   const ws = creatorWorkspace(slug);
@@ -102,7 +147,7 @@ function readCreatorsRegistry() {
 }
 
 function readPkg() {
-  try { return JSON.parse(readFileSync(PKG_JSON_PATH, "utf8")); } catch { return { version: "0.0.0", name: "@myclawpassport/bridge" }; }
+  try { return JSON.parse(readFileSync(PKG_JSON_PATH, "utf8")); } catch { return { version: "0.0.0", name: "@prmaat/bridge" }; }
 }
 
 function printHelp() {
@@ -114,7 +159,7 @@ Usage:
 
 Commands:
   init             Claim a pairing code from the web UI and write a fresh
-                   ap-client.json + device session in ~/.myclawpassport/
+                   ap-client.json + device session in ~/.prmaat/
   start            Run the bridge (foreground, Ctrl-C to stop)
   status           Check bridge state + recent log output
   doctor           Full self-diagnostic (exits 1 if any check fails)
@@ -672,7 +717,13 @@ async function cmdDoctor() {
 
   // ── launchd plist (macOS only) ──
   if (process.platform === "darwin") {
+    // v0.3.9: check both new and legacy plist names. Existing operator
+    // installs may still have plists under the old name; the doctor
+    // should find them so it can report them and recommend re-running
+    // `brainclaw bridge connect` to install the renamed plist.
     const plistCandidates = [
+      join(homedir(), "Library/LaunchAgents/com.prmaat.bridge.plist"),
+      "/Library/LaunchDaemons/com.prmaat.bridge.plist",
       join(homedir(), "Library/LaunchAgents/com.myclawpassport.bridge.plist"),
       "/Library/LaunchDaemons/com.myclawpassport.bridge.plist",
     ];
@@ -742,7 +793,7 @@ async function cmdDoctor() {
 // SWOT item #12 (2026-04-19). Lets operators install the bridge without
 // ever writing apt_/aptr_ to a plaintext file. Matches the same
 // service+account scheme used by ap-client.mjs runtime
-//   service = com.myclawpassport.bridge
+//   service = com.prmaat.bridge   (v0.3.9 canonical, was com.myclawpassport.bridge)
 //   account = "apt-<hash24>"  or  "aptr-<hash24>"  where <hash24> is
 //             sha256(passportId).slice(0,24). This keeps the passport DID
 //             out of `security dump-keychain` screenshots while staying
@@ -754,7 +805,10 @@ async function cmdDoctor() {
 // so `brainclaw keychain stash` writes into the right creator bucket.
 // The `brainclaw bridge init --creator <label>` command wraps this for
 // you by exporting AP_KEYCHAIN_SERVICE before calling keychain stash.
-const KEYCHAIN_SERVICE = process.env.AP_KEYCHAIN_SERVICE || "com.myclawpassport.bridge";
+// v0.3.9 (Mike directive 2026-05-06): default service renamed to
+// com.prmaat.bridge. ap-client.mjs runtime falls back to the legacy
+// com.myclawpassport.bridge service on read for existing keychains.
+const KEYCHAIN_SERVICE = process.env.AP_KEYCHAIN_SERVICE || "com.prmaat.bridge";
 
 function keychainHash(passportId) {
   return createHash("sha256").update(String(passportId)).digest("hex").slice(0, 24);
@@ -765,7 +819,7 @@ function aptrAccount(passportId) { return "aptr-" + keychainHash(passportId); }
 function ensureMacOS() {
   if (process.platform !== "darwin") {
     console.error(`[brainclaw] 'keychain' subcommand is macOS-only (platform=${process.platform}).`);
-    console.error(`[brainclaw] On Linux/Windows, store tokens in ~/.myclawpassport/ap-client.json (mode 600).`);
+    console.error(`[brainclaw] On Linux/Windows, store tokens in ~/.prmaat/ap-client.json (mode 600).`);
     process.exit(2);
   }
 }
@@ -873,10 +927,13 @@ Keychain storage:
 
   if (sub === "stash") {
     const rl = createInterface({ input, output });
-    const passportId = (await prompt(rl, "passportId (did:myclawpassport:...):")).trim();
-    if (!passportId.startsWith("did:myclawpassport:")) {
+    const passportId = (await prompt(rl, "passportId (did:prmaat:... or legacy did:myclawpassport:...):")).trim();
+    // v0.3.9: accept both the new canonical did:prmaat: prefix and the
+    // legacy did:myclawpassport: prefix. Existing passports minted under
+    // the old DID method (immutable per W3C) must continue to stash.
+    if (!passportId.startsWith("did:prmaat:") && !passportId.startsWith("did:myclawpassport:")) {
       rl.close();
-      console.error(`[brainclaw] passportId must start with did:myclawpassport:`);
+      console.error(`[brainclaw] passportId must start with did:prmaat: (or legacy did:myclawpassport:)`);
       process.exit(1);
     }
     const apt = (await prompt(rl, "apt_ token:")).trim();
@@ -941,8 +998,9 @@ Keychain storage:
 
   if (sub === "purge") {
     const passportId = rest[1];
-    if (!passportId || !passportId.startsWith("did:myclawpassport:")) {
-      console.error(`[brainclaw] usage: brainclaw keychain purge did:myclawpassport:...`);
+    // v0.3.9: accept both did:prmaat: and legacy did:myclawpassport: prefixes.
+    if (!passportId || (!passportId.startsWith("did:prmaat:") && !passportId.startsWith("did:myclawpassport:"))) {
+      console.error(`[brainclaw] usage: brainclaw keychain purge did:prmaat:...  (or legacy did:myclawpassport:...)`);
       process.exit(2);
     }
     const a = await keychainDelete(aptAccount(passportId));
@@ -1010,13 +1068,27 @@ Keychain storage:
 function bridgeWorkspace(label) {
   return join(homedir(), `ap-client-${label}`);
 }
+// v0.3.9 (Mike directive 2026-05-06, wave 23): plist + keychain service
+// names renamed `com.myclawpassport.bridge.<label>` → `com.prmaat.bridge.<label>`.
+// New per-creator bridges write to the new names; existing bridges keep
+// running under their old plist label (launchd has no in-place rename).
+// Operators rerun `brainclaw bridge connect <label>` to migrate to the
+// new name — that bootout's the legacy plist and installs the renamed one.
 function bridgePlistPath(label) {
-  return join(homedir(), "Library/LaunchAgents", `com.myclawpassport.bridge.${label}.plist`);
+  return join(homedir(), "Library/LaunchAgents", `com.prmaat.bridge.${label}.plist`);
 }
 function bridgeServiceName(label) {
-  return `com.myclawpassport.bridge.${label}`;
+  return `com.prmaat.bridge.${label}`;
 }
 function bridgeKeychainService(label) {
+  return `com.prmaat.bridge.${label}`;
+}
+// Legacy variants — used by the bridge connect/list commands to detect
+// already-installed bridges under the old name and offer a migration.
+function legacyBridgePlistPath(label) {
+  return join(homedir(), "Library/LaunchAgents", `com.myclawpassport.bridge.${label}.plist`);
+}
+function legacyBridgeServiceName(label) {
   return `com.myclawpassport.bridge.${label}`;
 }
 

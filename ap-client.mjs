@@ -63,42 +63,47 @@ process.stderr.write = function (chunk, enc, cb) {
 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// Step 2 of reliability mandate (2026-04-27): canonical config path is
-// ~/.myclawpassport/ap-client.json regardless of where ap-client.mjs lives.
-// Today's crash loop was rooted in three different ap-client.json files
-// existing at three paths (~/ap-client/, ~/.myclawpassport/,
-// ~/.myclawpassport/bridge/), with the daemon reading a different one
-// than the CLI was editing. By anchoring to $HOME, we close the split.
+// v0.3.9 (Mike directive 2026-05-06, brand cleanup wave 23): canonical
+// config path moves from ~/.myclawpassport/ → ~/.prmaat/ to align with
+// the rebrand. Existing installs continue to work transparently — on
+// first boot we detect the legacy directory and copy the config forward
+// to the new canonical path. Legacy directory is left in place so a
+// rollback is reversible; operator can rm -rf ~/.myclawpassport once
+// the new path is proven stable.
 //
 // Resolution order:
-//   1. $AP_CONFIG    — operator override (still wins)
-//   2. ~/.myclawpassport/ap-client.json  — canonical
-//   3. legacy fallback: ~/ap-client/ap-client.json (old install path)
-//      — if 2 doesn't exist but 3 does, we MIGRATE 3 → 2 on first read
-//      so subsequent boots are clean. Operator can still revert by
-//      setting AP_CONFIG explicitly.
+//   1. $AP_CONFIG                          — operator override (always wins)
+//   2. ~/.prmaat/ap-client.json            — new canonical (v0.3.9+)
+//   3. ~/.myclawpassport/ap-client.json    — legacy canonical (pre-v0.3.9)
+//   4. ~/ap-client/ap-client.json          — original install path (pre-v0.2.0)
+//
+// First-boot migration: if 2 doesn't exist but 3 (or 4) does, copy forward
+// to 2 so subsequent boots use the clean path. We migrate 3 first (more
+// recent), then 4 as a last resort, never overwriting 2.
 function resolveConfigPath() {
   if (process.env.AP_CONFIG) return process.env.AP_CONFIG;
-  const canonical = join(homedir(), ".myclawpassport", "ap-client.json");
-  const legacy = join(homedir(), "ap-client", "ap-client.json");
-  // First-boot migration: copy legacy → canonical if only legacy exists.
-  if (!existsSync(canonical) && existsSync(legacy)) {
-    try {
-      const dir = dirname(canonical);
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      const raw = readFileSync(legacy, "utf8");
-      writeFileSync(canonical, raw, { mode: 0o600 });
-      // Leave the legacy file in place but mark it stale via comment-ish key
-      // so a second migration is a no-op (canonical now exists).
-      console.log(`[ap-client] migrated config: ${legacy} → ${canonical}`);
-      console.log(`[ap-client]   (legacy file kept; remove manually after verifying canonical works)`);
-    } catch (err) {
-      console.warn(`[ap-client] config migration failed (non-fatal): ${err.message}`);
-      // Fall back to legacy path so the bridge still boots.
-      return legacy;
+  const canonical = join(homedir(), ".prmaat", "ap-client.json");
+  const legacyV02 = join(homedir(), ".myclawpassport", "ap-client.json");
+  const legacyV01 = join(homedir(), "ap-client", "ap-client.json");
+  // First-boot migration: prefer the most recent legacy file as the source.
+  if (!existsSync(canonical)) {
+    const source = existsSync(legacyV02) ? legacyV02 : (existsSync(legacyV01) ? legacyV01 : null);
+    if (source) {
+      try {
+        const dir = dirname(canonical);
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        const raw = readFileSync(source, "utf8");
+        writeFileSync(canonical, raw, { mode: 0o600 });
+        console.log(`[ap-client] migrated config: ${source} → ${canonical}`);
+        console.log(`[ap-client]   (legacy file kept for rollback; remove manually once new path proves stable)`);
+      } catch (err) {
+        console.warn(`[ap-client] config migration failed (non-fatal): ${err.message}`);
+        // Fall back to legacy path so the bridge still boots.
+        return source;
+      }
     }
   }
-  // Final fallback: if neither exists, return canonical anyway so the
+  // Final fallback: if nothing exists, return canonical anyway so the
   // operator-facing error message points at the right place.
   return canonical;
 }
@@ -196,7 +201,7 @@ function validateBrainBin(brainBin, agentLabel) {
 
 // Persisted session cache — Police T1.5 / Track 2 (2026-04-18):
 //   On macOS, aps_/apr_ live in the OS Keychain under service
-//   "com.myclawpassport.bridge", account=passportKey(passportId).
+//   "com.prmaat.bridge", account=passportKey(passportId).
 //   Success criteria (Police): "the bridge never stores apt_ or a creator
 //   JWT again, only apr_ in the OS keychain". After the bootstrap-from-apt
 //   exchange succeeds, apt_ + aptr_ on disk are nulled (purgeBootstrapSecrets).
@@ -207,11 +212,20 @@ const SESSION_STORE = process.env.AP_SESSION_STORE || join(__dirname, ".ap-sessi
 const IS_MACOS = process.platform === "darwin";
 // Keychain namespace — default matches the single-bridge deployment pattern.
 // For bridge-per-creator setups (2026-04-23, voted unanimous in the
-// brainstorm room), set AP_KEYCHAIN_SERVICE=com.myclawpassport.bridge.<label>
+// brainstorm room), set AP_KEYCHAIN_SERVICE=com.prmaat.bridge.<label>
 // so each creator's apt_/aptr_/aps_ entries live in an isolated keychain
 // bucket. The `brainclaw bridge init --creator <label>` command generates
 // a plist that sets this env var for the spawned bridge process.
-const KEYCHAIN_SERVICE = process.env.AP_KEYCHAIN_SERVICE || "com.myclawpassport.bridge";
+//
+// v0.3.9 (Mike directive 2026-05-06, wave 23): default service renamed
+// `com.myclawpassport.bridge` → `com.prmaat.bridge` to match the brand.
+// The legacy service name is still tried on read for backward compat,
+// so existing operator keychains (which were populated under the old
+// name) continue to work transparently. New keychain entries always
+// write to the new name. Operators can prune the legacy keychain
+// entries manually once their tokens have rotated.
+const KEYCHAIN_SERVICE = process.env.AP_KEYCHAIN_SERVICE || "com.prmaat.bridge";
+const LEGACY_KEYCHAIN_SERVICE = "com.myclawpassport.bridge";
 // Opt-out: AP_KEYCHAIN=0 forces file fallback even on macOS (debugging).
 const USE_KEYCHAIN = IS_MACOS && process.env.AP_KEYCHAIN !== "0";
 
@@ -376,11 +390,36 @@ function execFileP(bin, args, timeoutMs) {
 }
 async function keychainGet(account) {
   if (!USE_KEYCHAIN) return null;
-  const { err, stdout } = await execFileP("/usr/bin/security", [
+  // Read from canonical service first (com.prmaat.bridge as of v0.3.9).
+  const primary = await execFileP("/usr/bin/security", [
     "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w",
   ]);
-  if (err) return null;
-  return stdout.trim() || null;
+  if (!primary.err) return primary.stdout.trim() || null;
+  // v0.3.9 backward-compat: existing operator keychains were populated
+  // under the legacy service name (com.myclawpassport.bridge). Try that
+  // before giving up — but only if the operator hasn't overridden via
+  // AP_KEYCHAIN_SERVICE (in which case they want exact-match behavior).
+  if (!process.env.AP_KEYCHAIN_SERVICE) {
+    const fallback = await execFileP("/usr/bin/security", [
+      "find-generic-password", "-s", LEGACY_KEYCHAIN_SERVICE, "-a", account, "-w",
+    ]);
+    if (!fallback.err) {
+      const value = (fallback.stdout || "").trim();
+      if (value) {
+        // Migrate forward: copy the legacy keychain entry to the canonical
+        // service name so subsequent reads hit the primary path. Best-effort —
+        // if the keychain is locked or the user denies the prompt, we still
+        // return the value so the bridge keeps working.
+        try {
+          await execFileP("/usr/bin/security", [
+            "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", account, "-w", value,
+          ]);
+        } catch { /* migration is best-effort */ }
+        return value;
+      }
+    }
+  }
+  return null;
 }
 async function keychainSet(account, value) {
   if (!USE_KEYCHAIN) return false;
@@ -2267,9 +2306,15 @@ async function main() {
   // what was pruned, when, and why.
   if (pruneFromConfig.length > 0) {
     try {
-      const cfgPath = process.env.AP_CONFIG || (homedir() + "/.myclawpassport/ap-client.json");
-      const altCfgPath = homedir() + "/ap-client/ap-client.json"; // legacy path
-      const candidates = [cfgPath, altCfgPath].filter((p) => existsSync(p));
+      // v0.3.9: prune iterates EVERY config path the bridge might be
+      // reading from — canonical (.prmaat) + both legacy locations
+      // (.myclawpassport, ~/ap-client) — so if a bad-passport entry was
+      // duplicated across multiple files (dual-install state during
+      // migration), every copy gets pruned, not just the active one.
+      const cfgPath = process.env.AP_CONFIG || (homedir() + "/.prmaat/ap-client.json");
+      const legacyV02 = homedir() + "/.myclawpassport/ap-client.json";
+      const legacyV01 = homedir() + "/ap-client/ap-client.json";
+      const candidates = [cfgPath, legacyV02, legacyV01].filter((p) => existsSync(p));
       for (const path of candidates) {
         try {
           const raw = readFileSync(path, "utf8");
@@ -2369,7 +2414,7 @@ async function main() {
   if (allAgents.length === 0) {
     console.error("[ap-client] ⛔ No agents bootstrapped. The bridge will not connect to any rooms.");
     console.error("[ap-client] Fix one of the entries above, then restart:");
-    console.error("[ap-client]   launchctl kickstart -k gui/$(id -u)/com.myclawpassport.bridge");
+    console.error("[ap-client]   launchctl kickstart -k gui/$(id -u)/com.prmaat.bridge");
     console.error("[ap-client] Usage if you're setting up fresh:");
     console.error("[ap-client]   node ap-client.mjs apt_xxx apt_yyy apt_zzz   # multiple agents, one command");
     console.error("[ap-client]   node ap-client.mjs apt_xxx                    # single agent");
