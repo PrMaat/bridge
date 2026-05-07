@@ -36,6 +36,13 @@ import { fileURLToPath } from "url";
 import { homedir, hostname } from "os";
 import { createInterface } from "readline/promises";
 import { stdin as input, stdout as output } from "process";
+// v0.4.0-rc.1 (Mike directive 2026-05-07, R29 v0.2.1): Verifiable Execution
+// Receipts. At init, generate a local Ed25519 keypair; private goes to
+// the OS Keychain (macOS) or 0600 file (Linux); public is registered with
+// the platform via /api/devices/pair/claim alongside the pairing-code
+// claim. Per-message receipts are signed by the local private key in
+// ap-client.mjs runtime (see receipts.mjs for the signing primitives).
+import { generateDeviceKeypair } from "../receipts.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(__dirname, "..");
@@ -295,9 +302,20 @@ async function prompt(rl, question, def) {
   return answer || def || "";
 }
 
-async function claimPairingCode(code, deviceName) {
-  const body = JSON.stringify({ code, deviceName: deviceName || null });
-  // Note: /api/ prefix is required — nginx routes /api/* to the backend.
+async function claimPairingCode(code, deviceName, devicePublicKeyPem, deviceKeyId) {
+  // v0.4.0-rc.1 (R29 v0.2.1): include devicePublicKey + deviceKeyId in the
+  // claim payload so the platform registers them in `device_keys`. Server
+  // accepts the new fields; older servers ignore unknown keys (forward-
+  // compatible). If the bridge is running against a pre-v0.4 server, the
+  // public key is silently dropped — receipts will then verify under
+  // legacy_bearer_only mode (graceful degradation).
+  const body = JSON.stringify({
+    code,
+    deviceName: deviceName || null,
+    devicePublicKeyPem: devicePublicKeyPem || null,
+    deviceKeyId: deviceKeyId || null,
+    bridgeVersion: readPkg().version || null,
+  });
   const res = await fetch(`${DEFAULT_VPS}/api/devices/pair/claim`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -313,17 +331,54 @@ async function claimPairingCode(code, deviceName) {
 // Fetch the bootstrap summary so we know the agent name, server-selected
 // openclaw agent, and available rooms. This hits the apt_-authenticated
 // /agent/bootstrap endpoint the bridge uses at runtime too.
-async function agentBootstrap(aptToken) {
+async function agentBootstrap(aptToken, devicePublicKeyPem, deviceKeyId) {
+  // v0.4.0-rc.1: include device public key in bootstrap so token-mode
+  // enrollment also registers a signing key. Older servers ignore the
+  // extra fields.
+  const body = JSON.stringify({
+    devicePublicKeyPem: devicePublicKeyPem || null,
+    deviceKeyId: deviceKeyId || null,
+    bridgeVersion: readPkg().version || null,
+  });
   const res = await fetch(`${DEFAULT_VPS}/agent/bootstrap`, {
     method: "POST",
     headers: { "Authorization": `Bearer ${aptToken}`, "Content-Type": "application/json" },
-    body: "{}",
+    body,
   });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`bootstrap failed: HTTP ${res.status} — ${t.slice(0, 200)}`);
   }
   return res.json();
+}
+
+// v0.4.0-rc.1: stash the device Ed25519 private key. macOS uses the
+// login Keychain (service `com.prmaat.bridge.signing`, account=keyId);
+// Linux/other writes a 0600 file at ~/.prmaat/keys/<keyId>.pem. The
+// public key + keyId travel to the platform; the private key never
+// leaves this machine.
+function stashDevicePrivateKey(keyId, privateKeyPem) {
+  if (process.platform === "darwin") {
+    try {
+      execFileSync("/usr/bin/security", [
+        "add-generic-password",
+        "-s", "com.prmaat.bridge.signing",
+        "-a", keyId,
+        "-w", privateKeyPem,
+        "-U", // update if already exists
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+      return { storage: "macos-keychain", location: `com.prmaat.bridge.signing/${keyId}` };
+    } catch (err) {
+      // fall through to file storage
+      console.warn(`[brainclaw] keychain stash failed (${err.message}) — falling back to 0600 file`);
+    }
+  }
+  const keyDir = join(HOME_DIR, "keys");
+  if (!existsSync(keyDir)) mkdirSync(keyDir, { recursive: true, mode: 0o700 });
+  const keyPath = join(keyDir, `${keyId}.pem`);
+  writeFileSync(keyPath, privateKeyPem, { mode: 0o600 });
+  try { chmodSync(keyPath, 0o600); } catch {}
+  return { storage: "file", location: keyPath };
 }
 
 async function cmdInit() {
@@ -355,10 +410,14 @@ async function cmdInit() {
     if (!code) { rl.close(); console.error(`[brainclaw] no code entered — aborting.`); process.exit(1); }
     const deviceName = await prompt(rl, "Device name (this machine)", process.env.HOSTNAME || "unknown-device");
     rl.close();
-    console.log(`[brainclaw] claiming code...`);
+    console.log(`[brainclaw] generating device Ed25519 signing keypair...`);
+    const kp = generateDeviceKeypair();
+    const stash = stashDevicePrivateKey(kp.keyId, kp.privateKeyPem);
+    console.log(`[brainclaw] ✓ keypair generated. key_id=${kp.keyId} (${stash.storage})`);
+    console.log(`[brainclaw] claiming code + registering public key...`);
     let claim;
     try {
-      claim = await claimPairingCode(code.trim(), deviceName.trim());
+      claim = await claimPairingCode(code.trim(), deviceName.trim(), kp.publicKeyPem, kp.keyId);
     } catch (err) { console.error(`[brainclaw] ${err.message}`); process.exit(1); }
     // Server (post Phase 2.1, 2026-04-19) returns { token, rotateToken, ... }
     // We keep legacy fallbacks (apt, agentToken) for paranoia during rollout.
@@ -381,6 +440,7 @@ async function cmdInit() {
           passportId: claim.passportId,
           apt: token,
           aptr: rotateToken,
+          deviceKeyId: kp.keyId,
           pairedAt: new Date().toISOString(),
         }],
       };
@@ -399,10 +459,14 @@ async function cmdInit() {
   } else if (mode === "2") {
     const token = await prompt(rl, "apt_ token:");
     if (!token || !token.startsWith("apt_")) { rl.close(); console.error(`[brainclaw] token must start with apt_ — aborting.`); process.exit(1); }
-    console.log(`[brainclaw] verifying token...`);
+    console.log(`[brainclaw] generating device Ed25519 signing keypair...`);
+    const kp = generateDeviceKeypair();
+    const stash = stashDevicePrivateKey(kp.keyId, kp.privateKeyPem);
+    console.log(`[brainclaw] ✓ keypair generated. key_id=${kp.keyId} (${stash.storage})`);
+    console.log(`[brainclaw] verifying token + registering public key...`);
     let boot;
     try {
-      boot = await agentBootstrap(token.trim());
+      boot = await agentBootstrap(token.trim(), kp.publicKeyPem, kp.keyId);
     } catch (err) { rl.close(); console.error(`[brainclaw] ${err.message}`); process.exit(1); }
     const rooms = (boot.rooms || []).map((r) => r.id || r).slice(0, 10);
     rl.close();
@@ -411,6 +475,7 @@ async function cmdInit() {
         name: boot.agentName || boot.name || "Agent",
         passportId: boot.passportId,
         token: token.trim(),
+        deviceKeyId: kp.keyId,
         openclawAgent: boot.openclawAgent || null,
         rooms,
       }],

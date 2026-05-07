@@ -22,6 +22,7 @@ import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { homedir } from "os";
 import { makeRunBrain, sanitizeBrainOutput } from "./brains.mjs";
+import { signReceipt, computeReceiptHash } from "./receipts.mjs";
 
 // ── B2 log scrubbing (2026-04-22, voted unanimous) ────────────────────────
 // Regex-filter token prefixes from stdout/stderr BEFORE they hit the log
@@ -1354,6 +1355,101 @@ function checkB3PostRate(passportId, roomId) {
   return { allowed: true, countInWindow: prev.length };
 }
 
+// ── Receipt signing (R29 v0.2.1 Verifiable Execution Receipts) ─────────────
+// Per-message JWS signed by the device's Ed25519 private key. Forward-
+// compatible: if any step fails (no deviceKeyId in cfg, key not in
+// keychain, /agent/nonce not yet implemented on the server), we silently
+// fall back to a legacy bearer-only post. The server records receipts
+// when present and treats the row as `legacy_bearer_only` otherwise.
+const SIGNING_KEY_KEYCHAIN_SERVICE = "com.prmaat.bridge.signing";
+const _signingKeyCache = new Map(); // keyId → privateKeyPem
+
+async function loadDeviceSigningKey(keyId) {
+  if (!keyId) return null;
+  if (_signingKeyCache.has(keyId)) return _signingKeyCache.get(keyId);
+  let pem = null;
+  if (IS_MACOS && process.env.AP_KEYCHAIN !== "0") {
+    const r = await execFileP("/usr/bin/security", [
+      "find-generic-password", "-s", SIGNING_KEY_KEYCHAIN_SERVICE, "-a", keyId, "-w",
+    ]);
+    if (!r.err) pem = (r.stdout || "").trim() || null;
+  }
+  if (!pem) {
+    const filePath = join(homedir(), ".prmaat", "keys", `${keyId}.pem`);
+    if (existsSync(filePath)) {
+      try { pem = readFileSync(filePath, "utf8"); } catch {}
+    }
+  }
+  if (pem) _signingKeyCache.set(keyId, pem);
+  return pem;
+}
+
+async function fetchServerNonce(token, passportId, deviceKeyId, roomId) {
+  try {
+    const res = await fetch(`${VPS_HTTP}/agent/nonce`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ passportId, deviceKeyId, roomId }),
+    });
+    if (!res.ok) return null;
+    const j = await res.json().catch(() => null);
+    return j && j.nonce ? j.nonce : null;
+  } catch { return null; }
+}
+
+let _bridgeVersionCached = null;
+function bridgeVersion() {
+  if (_bridgeVersionCached) return _bridgeVersionCached;
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "package.json");
+    _bridgeVersionCached = JSON.parse(readFileSync(pkgPath, "utf8")).version;
+  } catch { _bridgeVersionCached = "unknown"; }
+  return _bridgeVersionCached;
+}
+
+function sha256Hex(s) {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+// Build + sign a receipt for an outbound message. Returns null on any
+// missing prerequisite (no key, no nonce, etc.) — caller falls back to
+// legacy bearer-only post.
+async function buildAndSignReceipt({ roomId, agent, content, model, accessToken }) {
+  const deviceKeyId = agent.deviceKeyId;
+  if (!deviceKeyId) return null;
+  const privateKeyPem = await loadDeviceSigningKey(deviceKeyId);
+  if (!privateKeyPem) return null;
+  const nonce = await fetchServerNonce(accessToken, agent.passportId, deviceKeyId, roomId);
+  if (!nonce) return null; // server doesn't yet support /agent/nonce → fall back
+  const messageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const receipt = {
+    v: "v0.2.1",
+    room_id: roomId,
+    passport_did: agent.passportId,
+    device_key_id: deviceKeyId,
+    bridge_version: bridgeVersion(),
+    message_id: messageId,
+    model_provider: model
+      ? { id: model, version: null, declared_by: "operator" }
+      : { id: "unknown", version: null, declared_by: "operator" },
+    prompt_hash: "",
+    tool_call_transcript_hash: "",
+    output_hash: sha256Hex(content || ""),
+    capability_scope: { rooms: [roomId], rate: "5/min", actions: ["post"] },
+    server_nonce: nonce,
+    timestamp: new Date().toISOString(),
+    previous_receipt_hash: agent._lastReceiptHash || "0".repeat(64),
+  };
+  try {
+    const signed = signReceipt(receipt, privateKeyPem);
+    agent._lastReceiptHash = signed.receiptHash;
+    return { receipt, jws: signed.jws, receiptHash: signed.receiptHash, messageId };
+  } catch (err) {
+    console.warn(`[${agent.name}] receipt sign failed: ${err.message} — falling back to legacy bearer-only`);
+    return null;
+  }
+}
+
 async function postReply(roomId, agent, content, model, modelAttested) {
   // B3 rate-limit guard. Runaway? → skip + log, don't error.
   const rate = checkB3PostRate(agent.passportId, roomId);
@@ -1372,6 +1468,16 @@ async function postReply(roomId, agent, content, model, modelAttested) {
   async function attempt() {
     const token = await ensureAccessToken(agent);
     if (!token) return null; // Track 2: no session + no apt_ → can't post
+    // R29 v0.2.1: try to attach a signed receipt. If any prerequisite is
+    // missing (no device key, no nonce endpoint), the build returns null
+    // and we fall back to legacy bearer-only — the server will record
+    // receipt_type='legacy_bearer_only' for that row.
+    const signed = await buildAndSignReceipt({ roomId, agent, content, model, accessToken: token });
+    if (signed) {
+      body.receipt_jws = signed.jws;
+      body.receipt_hash = signed.receiptHash;
+      body.message_id = signed.messageId;
+    }
     const res = await fetch(`${VPS_HTTP}/agent/rooms/${roomId}/messages`, {
       method: "POST",
       headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
