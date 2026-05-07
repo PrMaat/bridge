@@ -28,7 +28,16 @@
  *   OPENCLAW_BIN          OpenClaw CLI path (default /Users/mikebot/.openclaw/bin/openclaw)
  *   AP_TOOLS_ENABLED      Per-agent tool-call allowlist (default off)
  */
-import { spawn, execFileSync } from "child_process";
+import { spawn, execFile, execFileSync } from "child_process";
+
+// Async execFile wrapper (mirrors ap-client.mjs#execFileP).
+function execFileP(bin, args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: timeoutMs || 5000 }, (err, stdout, stderr) => {
+      resolve({ err, stdout: stdout || "", stderr: stderr || "" });
+    });
+  });
+}
 import { createHash } from "crypto";
 import { readFileSync, existsSync, mkdirSync, statSync, chmodSync, writeFileSync, renameSync } from "fs";
 import { dirname, join, resolve } from "path";
@@ -352,6 +361,94 @@ async function agentBootstrap(aptToken, devicePublicKeyPem, deviceKeyId) {
   return res.json();
 }
 
+// v0.4.0-rc.2: operator-confirmation gate. Pops a native OS dialog
+// before any pairing-code claim, so an AI piping stdin into `brainclaw
+// init` cannot complete enrollment without a real human keystroke at
+// the window-server level. The dialog is the moat: AppleScript /
+// zenity / kdialog / PowerShell MessageBox all require display-server
+// input that LLM-driven processes literally cannot synthesize.
+//
+// Fallback chain (most-trusted → least-trusted):
+//   1. macOS  → /usr/bin/osascript display dialog                (TRUSTED)
+//   2. Linux  → /usr/bin/zenity --question or kdialog --yesno    (TRUSTED if X/Wayland session present)
+//   3. Headless or no GUI utility → require process.stdin.isTTY  (PARTIAL — operator must be at a real terminal)
+//   4. Piped stdin and no GUI    → REFUSE with OPERATOR_CONFIRMATION_REQUIRED
+//
+// --operator-confirmed bypasses the gate entirely. Documented as a CI/
+// launchd-only flag. AI agents pasting briefs should NEVER set it; if
+// they do, the brief becomes self-evident grep-bait in shell history.
+async function operatorConfirmEnrollment(summary) {
+  if (globalThis.__BRAINCLAW_OPERATOR_CONFIRMED) {
+    console.log(`[brainclaw] --operator-confirmed flag set; skipping native dialog (CI/launchd path).`);
+    return true;
+  }
+  const title = "PrMaat — confirm bridge enrollment";
+  const body = [
+    "Click Confirm only if YOU minted this code on the dashboard.",
+    "",
+    `Code:        ${summary.code}`,
+    `Server:      ${summary.vps}`,
+    `Device:      ${summary.deviceName}`,
+    "Tokens:      apt_ (7d) + aptr_ (rotate)",
+    "Stored in:   macOS Keychain (com.prmaat.bridge.signing)",
+  ].join("\n");
+  // 1. macOS dialog
+  if (process.platform === "darwin") {
+    try {
+      // osascript -e 'display dialog "..." with title "..." buttons {"Cancel","Confirm"} default button "Confirm"'
+      const r = await execFileP("/usr/bin/osascript", [
+        "-e",
+        `display dialog "${body.replace(/"/g, '\\"')}" with title "${title}" buttons {"Cancel","Confirm"} default button "Confirm" cancel button "Cancel" with icon caution`,
+      ], 120000);
+      // osascript returns "button returned:Confirm" on success, exit 1 on Cancel.
+      const ok = !r.err && /Confirm/i.test(r.stdout);
+      if (ok) console.log(`[brainclaw] ✓ operator confirmed via macOS dialog`);
+      else console.log(`[brainclaw] ✗ operator declined or dialog dismissed`);
+      return ok;
+    } catch (err) {
+      console.warn(`[brainclaw] macOS dialog failed (${err.message}); falling back to TTY prompt`);
+    }
+  }
+  // 2. Linux GUI dialogs
+  if (process.platform === "linux") {
+    for (const [bin, args] of [
+      ["/usr/bin/zenity", ["--question", "--no-wrap", "--title", title, "--text", body, "--ok-label=Confirm", "--cancel-label=Cancel"]],
+      ["/usr/bin/kdialog", ["--title", title, "--yesno", body]],
+    ]) {
+      if (existsSync(bin)) {
+        try {
+          const r = await execFileP(bin, args, 120000);
+          const ok = !r.err;
+          if (ok) console.log(`[brainclaw] ✓ operator confirmed via ${bin.split("/").pop()}`);
+          else console.log(`[brainclaw] ✗ operator declined ${bin.split("/").pop()}`);
+          return ok;
+        } catch { /* try next */ }
+      }
+    }
+  }
+  // 3. TTY fallback — only if a real terminal is connected. AI-driven
+  // pipes set isTTY === false on stdin, so they cannot satisfy this.
+  if (process.stdin.isTTY) {
+    console.log(`\n──── PrMaat enrollment confirmation ────\n${body}\n`);
+    const rl = createInterface({ input, output });
+    const ans = (await rl.question("Type the word CONFIRM (uppercase) to proceed, or anything else to cancel: ")).trim();
+    rl.close();
+    const ok = ans === "CONFIRM";
+    if (ok) console.log(`[brainclaw] ✓ operator confirmed via TTY prompt`);
+    else console.log(`[brainclaw] ✗ operator did not type CONFIRM`);
+    return ok;
+  }
+  // 4. Refuse — no GUI, no TTY, no --operator-confirmed flag.
+  console.error(`\n[brainclaw] ✗ OPERATOR_CONFIRMATION_REQUIRED`);
+  console.error(`  Cannot prompt: stdin is not a TTY and no GUI dialog utility found.`);
+  console.error(`  Re-run from a real terminal, or pass --operator-confirmed if you are`);
+  console.error(`  in a CI / launchd-restart path that requires headless enrollment.`);
+  console.error(`  This refusal is intentional: bridges enrolled without operator presence`);
+  console.error(`  cannot be attributed to a human-in-the-loop, which is the entire point\n`);
+  console.error(`  of the device-key + signed-receipt model (R29 v0.2.1).`);
+  return false;
+}
+
 // v0.4.0-rc.1: stash the device Ed25519 private key. macOS uses the
 // login Keychain (service `com.prmaat.bridge.signing`, account=keyId);
 // Linux/other writes a 0600 file at ~/.prmaat/keys/<keyId>.pem. The
@@ -410,6 +507,18 @@ async function cmdInit() {
     if (!code) { rl.close(); console.error(`[brainclaw] no code entered — aborting.`); process.exit(1); }
     const deviceName = await prompt(rl, "Device name (this machine)", process.env.HOSTNAME || "unknown-device");
     rl.close();
+    // v0.4.0-rc.2: operator confirmation BEFORE we burn the code or
+    // touch the keychain. If the operator declines (or is an AI piping
+    // stdin with no real human present), we abort without side effects.
+    const confirmed = await operatorConfirmEnrollment({
+      code: code.trim(),
+      vps: DEFAULT_VPS,
+      deviceName: deviceName.trim(),
+    });
+    if (!confirmed) {
+      console.error(`[brainclaw] enrollment cancelled (operator declined or could not confirm).`);
+      process.exit(2);
+    }
     console.log(`[brainclaw] generating device Ed25519 signing keypair...`);
     const kp = generateDeviceKeypair();
     const stash = stashDevicePrivateKey(kp.keyId, kp.privateKeyPem);
@@ -459,6 +568,17 @@ async function cmdInit() {
   } else if (mode === "2") {
     const token = await prompt(rl, "apt_ token:");
     if (!token || !token.startsWith("apt_")) { rl.close(); console.error(`[brainclaw] token must start with apt_ — aborting.`); process.exit(1); }
+    // v0.4.0-rc.2: operator confirmation gate (token mode).
+    const tokenConfirmed = await operatorConfirmEnrollment({
+      code: `${token.slice(0, 12)}…`, // mask the secret part
+      vps: DEFAULT_VPS,
+      deviceName: process.env.HOSTNAME || "unknown-device",
+    });
+    if (!tokenConfirmed) {
+      rl.close();
+      console.error(`[brainclaw] enrollment cancelled (operator declined or could not confirm).`);
+      process.exit(2);
+    }
     console.log(`[brainclaw] generating device Ed25519 signing keypair...`);
     const kp = generateDeviceKeypair();
     const stash = stashDevicePrivateKey(kp.keyId, kp.privateKeyPem);
@@ -2426,12 +2546,23 @@ async function main() {
   // refused when --no-self-attest is on. This gives AI agents and CI
   // runners a clean enrollment path: the operator pre-fills every
   // attestable value in --config, and the bridge runs purely operationally.
+  // v0.4.0-rc.2 (Mike directive 2026-05-07, post-Antigravity-refusal review):
+  // --operator-confirmed bypasses the native OS confirmation dialog. ONLY for
+  // headless / CI / launchd-restart paths where a human cannot click. Setting
+  // it from a brief an AI is asked to paste defeats the whole point — and the
+  // brief becomes self-incriminating evidence (the operator can grep their
+  // shell history for it). All AI-driven enrollment paths should leave it OFF
+  // and let the system dialog gate the claim.
+  let __operatorConfirmed = false;
   const flagFiltered = [];
   for (const arg of rest) {
     if (arg === "--non-interactive") { setNonInteractive(true); continue; }
     if (arg === "--no-self-attest")  { setNoSelfAttest(true);  continue; }
+    if (arg === "--operator-confirmed") { __operatorConfirmed = true; continue; }
     flagFiltered.push(arg);
   }
+  // Stash for cmdInit. Plain global is fine — no concurrency in a CLI.
+  globalThis.__BRAINCLAW_OPERATOR_CONFIRMED = __operatorConfirmed;
 
   switch (cmd) {
     case "start":    return cmdStart(flagFiltered);

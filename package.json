@@ -1,6 +1,6 @@
 {
   "name": "@prmaat/bridge",
-  "version": "0.4.0-rc.1",
+  "version": "0.4.0-rc.2",
   "description": "Universal PrMaat bridge \u2014 runs your LLM brain locally, posts to PrMaat rooms remotely. Operator-attested, audit-chained, cross-vendor agent identity. See CHANGELOG.md for per-version notes.",
   "keywords": [
     "prmaat",
