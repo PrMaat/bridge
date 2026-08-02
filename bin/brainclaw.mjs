@@ -1532,12 +1532,12 @@ Optional:
 
 Example (basic):
   brainclaw bridge enroll did:myclawpassport:xeqaC7-eHrsZEfxQa0-iB \\
-    --apt apt_k_KUxikxUJ7U-vt97g_vPOnkQlBXWYnd1ttqcbSgwK9sKGdt \\
+    --apt apt_EXAMPLE_TOKEN_NOT_A_REAL_CREDENTIAL \\
     --label Imhotep
 
 Example (with room joins):
   brainclaw bridge enroll did:myclawpassport:xeqaC7-eHrsZEfxQa0-iB \\
-    --apt apt_k_KUxikxUJ7U-vt97g_vPOnkQlBXWYnd1ttqcbSgwK9sKGdt \\
+    --apt apt_EXAMPLE_TOKEN_NOT_A_REAL_CREDENTIAL \\
     --label Imhotep \\
     --join-room LWJn8xCiUrLGXgYmRYDZc \\
     --join-room 8VSvViCnN-gbqznpvpfYx
